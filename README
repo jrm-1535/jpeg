@@ -1,6 +1,6 @@
-#github.com/jrm-1535/jepg
+#jpeg
 
-A small jpeg library analysing jpeg files (JIFF)
+A small jpeg library analysing jpeg files (JFIF)
 
 The libary provides functions to analyse and display JPEG markers and tables
 found in the input file. It checks the validity of those tables and scans and
