@@ -4,7 +4,6 @@ package jpeg
 import (
     "fmt"
     "bytes"
-//    "strings"
     "os"
     "io"
     "io/ioutil"
@@ -98,6 +97,23 @@ func (jpg *JpegDesc) getJPEGStateName( ) string {
     return names[ jpg.state ]
 }
 
+type Control struct {
+    Markers         bool    // show JPEG markers as they are parsed
+    Content         bool    // display content of JPEG segments
+    Quantizers      bool    // display quantization matrices as defined
+    Lengths         bool    // display huffman table (code length & symbols)
+    Codes           bool    // display huffman code for each symbol
+    Mcu             bool    // display MCUs as they are parsed
+    Du              bool    // display each DU resulting from MCU parsing
+    Fix             bool    // try and fix errors if possible
+    Begin, End      uint    // control MCU &DU display (from begin to end, included)
+}
+
+type Metadata struct {
+    SampleSize      uint    // number of bits per pixel
+    Width, Height   uint    // image size in pixels
+}
+
 type source uint                // whether segment is from raw data or has been modified after fixing
 
 const (
@@ -110,13 +126,13 @@ type segment struct {           // one for each table, scan or group of scans
     start, stop     uint        // offsets where to start and stop segment
 }
 
-type DCTRow         [][64]int   // dequantizised DCT matrices (yet to inverse)
+type iDCTRow        [][64]int   // dequantizised iDCT matrices (yet to inverse)
 
 type scanComp struct {
     hDC, hAC        *hcnode     // huffman roots for DC and AC coefficients
                                 // use hDC for 1st sample, hAC for all others
     dUnits          [][64]int   // up to vSF rows of hSF data units (64 int)
-    DCTdata         []DCTRow    // rows of reordered DCT matrices
+    iDCTdata        []iDCTRow   // rows of reordered iDCT matrices
     previousDC      int         // previous DC value for this component
     nUnitsRow       uint        // n units per row = nSamplesLines/8
     hSF, vSF        uint        // horizontal & vertical sampling factors
@@ -171,7 +187,11 @@ type sampling  struct {
     mhSF, mvSF      uint        // max horizontal and vertical sampling factors
 }
 
-// JpegDesc is the internal structure describing the JPEG file - without SOI and EOI
+type control struct {
+                    Control
+}
+
+// JpegDesc is the internal structure describing the JPEG file
 type JpegDesc struct {
     data            []byte      // raw data file
     update          []byte      // modified data (only if fix is true and issues are encountered)
@@ -180,8 +200,8 @@ type JpegDesc struct {
     state           int         // INIT, IMAGE, FRAME, SCAN1, REMAINING, FINAL
 
     app0Extension   bool        // APP0 followed by APP0 extension
-    DNL             bool        // DNL table processed
-    DNLnLines       uint        // DNL given nLines in picture
+    pDNL            bool        // DNL table processed
+    gDNLnLines      uint        // DNL given nLines in picture
     nMcuRST         uint        // number of MCUs expected between RSTn
 
     qdefs           [4]qdef     // Quantization zig-zag coefficients for 4 destinations
@@ -193,62 +213,61 @@ type JpegDesc struct {
     resolution      sampling    // luminance (greyscale) or YCbCr picture sampling resolution
     scans           []scan      // for the scans following SOFn
 
-    Control                     // what to print/fix during analysis
+                    control     // what to print/fix during analysis
 }
 
 const (                 // JPEG Marker Definitions
 
-    _TEM   = 0xff01 // Temporary use in arithmetic coding
+    _TEM   = 0xff01     // Temporary use in arithmetic coding
 
-    _SOF0  = 0xffC0      // Start Of Frame Huffman-coding frames (Baseline DCT)
-    _SOF1  = 0xffc1      // Start Of Frame Huffman-coding frames (Extended Sequential DCT)
-    _SOF2  = 0xffc2      // Start Of Frame Huffman-coding frames (Progressive DCT)
-    _SOF3  = 0xffc3      // Start Of Frame Huffman-coding frames (Lossless / sequential)
-    _DHT   = 0xffc4      // Define Huffman Table
-    _SOF5  = 0xffc5      // Start Of Frame Differential Huffman-coding frames (Sequential DCT)
-    _SOF6  = 0xffc6      // Start Of Frame Differential Huffman-coding frames (Progressive DCT)
-    _SOF7  = 0xffc7      // Start Of Frame Differential Huffman-coding frames (Lossless0
-    _JPG   = 0xffc8      // Reserved for JPEG extensions
-    _SOF9  = 0xffc9      // Start Of Frame Arithmetic-coding FRames (Extended sequential DCT)
-    _SOF10 = 0xffca      // Start Of Frame Arithmetic-coding FRames (Progressive DCT)
-    _SOF11 = 0xffcb      // Start Of Frame Arithmetic-coding FRames (Lossless / sequential)
-    _DAC   = 0xffcc      // Define Arithmetic Coding Table
-    _SOF13 = 0xffcd      // Start Of Frame Differential Arithmetic-coding FRames (Sequential DCT)
-    _SOF14 = 0xffce      // Start Of Frame Differential Arithmetic-coding FRames (Progressive DCT)
-    _SOF15 = 0xffcf      // Start Of Frame Differential Arithmetic-coding FRames (Lossless)
+    _SOF0  = 0xffC0     // Start Of Frame Huffman-coding frames (Baseline DCT)
+    _SOF1  = 0xffc1     // Start Of Frame Huffman-coding frames (Extended Sequential DCT)
+    _SOF2  = 0xffc2     // Start Of Frame Huffman-coding frames (Progressive DCT)
+    _SOF3  = 0xffc3     // Start Of Frame Huffman-coding frames (Lossless / sequential)
+    _DHT   = 0xffc4     // Define Huffman Table
+    _SOF5  = 0xffc5     // Start Of Frame Differential Huffman-coding frames (Sequential DCT)
+    _SOF6  = 0xffc6     // Start Of Frame Differential Huffman-coding frames (Progressive DCT)
+    _SOF7  = 0xffc7     // Start Of Frame Differential Huffman-coding frames (Lossless0
+    _JPG   = 0xffc8     // Reserved for JPEG extensions
+    _SOF9  = 0xffc9     // Start Of Frame Arithmetic-coding FRames (Extended sequential DCT)
+    _SOF10 = 0xffca     // Start Of Frame Arithmetic-coding FRames (Progressive DCT)
+    _SOF11 = 0xffcb     // Start Of Frame Arithmetic-coding FRames (Lossless / sequential)
+    _DAC   = 0xffcc     // Define Arithmetic Coding Table
+    _SOF13 = 0xffcd     // Start Of Frame Differential Arithmetic-coding FRames (Sequential DCT)
+    _SOF14 = 0xffce     // Start Of Frame Differential Arithmetic-coding FRames (Progressive DCT)
+    _SOF15 = 0xffcf     // Start Of Frame Differential Arithmetic-coding FRames (Lossless)
 
-    _RST0  = 0xffd0      // ReStarT #0
-    _RST1  = 0xffd1      // ReStarT #1
-    _RST2  = 0xffd2      // ReStarT #2
-    _RST3  = 0xffd3      // ReStarT #3
-    _RST4  = 0xffd4      // ReStarT #4
-    _RST5  = 0xffd5      // ReStarT #5
-    _RST6  = 0xffd6      // ReStarT #6
-    _RST7  = 0xffd7      // ReStarT #7
-    _SOI   = 0xffd8      // Start Of Image
-    _EOI   = 0xffd9      // End Of Image
-    _SOS   = 0xffda      // Start Of Scan
-    _DQT   = 0xffdb      // Define Quantization Table
-    _DNL   = 0xffdc      // Define Number of lines
-    _DRI   = 0xffdd      // Define Reset Interval
-    _DHP   = 0xffde      // Define Hierarchical Progression
-    _EXP   = 0xffdf      // Expand reference image
+    _RST0  = 0xffd0     // ReStarT #0
+    _RST1  = 0xffd1     // ReStarT #1
+    _RST2  = 0xffd2     // ReStarT #2
+    _RST3  = 0xffd3     // ReStarT #3
+    _RST4  = 0xffd4     // ReStarT #4
+    _RST5  = 0xffd5     // ReStarT #5
+    _RST6  = 0xffd6     // ReStarT #6
+    _RST7  = 0xffd7     // ReStarT #7
+    _SOI   = 0xffd8     // Start Of Image
+    _EOI   = 0xffd9     // End Of Image
+    _SOS   = 0xffda     // Start Of Scan
+    _DQT   = 0xffdb     // Define Quantization Table
+    _DNL   = 0xffdc     // Define Number of lines
+    _DRI   = 0xffdd     // Define Reset Interval
+    _DHP   = 0xffde     // Define Hierarchical Progression
+    _EXP   = 0xffdf     // Expand reference image
 
-    _APP0  = 0xffe0      // Application Vendor Specific #0 (JFIF)
-    _APP2  = 0xffe2      // Application Vendor Specific #2
-    _APP3  = 0xffe3      // Application Vendor Specific #3
-    _APP4  = 0xffe4      // Application Vendor Specific #4
-    _APP5  = 0xffe5      // Application Vendor Specific #5
-    _APP6  = 0xffe6      // Application Vendor Specific #6
-    _APP7  = 0xffe7      // Application Vendor Specific #7
-    _APP8  = 0xffe8      // Application Vendor Specific #8
-    _APP9  = 0xffe9      // Application Vendor Specific #9
-    _APP10 = 0xffea      // Application Vendor Specific #10
-    _APP11 = 0xffeb      // Application Vendor Specific #11
-    _APP12 = 0xffec      // Application Vendor Specific #12
-    _APP13 = 0xffed      // Application Vendor Specific #13
-
-    _COM   = 0xfffe      // Comment (text)
+    _APP0  = 0xffe0     // Application Vendor Specific #0 (JFIF)
+    _APP2  = 0xffe2     // Application Vendor Specific #2
+    _APP3  = 0xffe3     // Application Vendor Specific #3
+    _APP4  = 0xffe4     // Application Vendor Specific #4
+    _APP5  = 0xffe5     // Application Vendor Specific #5
+    _APP6  = 0xffe6     // Application Vendor Specific #6
+    _APP7  = 0xffe7     // Application Vendor Specific #7
+    _APP8  = 0xffe8     // Application Vendor Specific #8
+    _APP9  = 0xffe9     // Application Vendor Specific #9
+    _APP10 = 0xffea     // Application Vendor Specific #10
+    _APP11 = 0xffeb     // Application Vendor Specific #11
+    _APP12 = 0xffec     // Application Vendor Specific #12
+    _APP13 = 0xffed     // Application Vendor Specific #13
+    _COM   = 0xfffe     // Comment (text)
 )
 
 func getJPEGTagName( tag uint ) string {
@@ -1238,6 +1257,8 @@ func (jpg *JpegDesc) getBits( startByte, val uint, startBit, nBits uint8 ) strin
                     startByte, jpg.data[startByte])
 //        fmt.Fprintf( &buf, "                               ")
     } else {
+//offset=0x269 [0xf5       00111---] Huffman: size 7 (0-runlength 0)
+//offset=0x26a [0xf512     -----101 0001----] DC: decoded=81 cumulative=81
         fmt.Fprintf( &buf, "offset=%#x [%#02x",
                     startByte, jpg.data[startByte])
 
@@ -1265,18 +1286,18 @@ func (jpg *JpegDesc) getBits( startByte, val uint, startBit, nBits uint8 ) strin
         if s + n <= 8 {
             fmt.Fprintf( &buf, "%0*b", n, val )
         } else {
-            fmt.Fprintf( &buf, "%0*b", 8 - s, val >> (s + n - 8) )
+            fmt.Fprintf( &buf, "%0*b", 8 - s, val >> uint(s + n - 8) )
             buf.Write([]byte(" "))
             s -= 8
             if s + n > 8 { // at most 7 + 16
                 //fmt.Printf( "reminings bits=%d\n", s + n
-                v := val >> (s + n - 8)
+                v := val >> uint(s + n - 8)
                 fmt.Fprintf( &buf, "%0*b", 8, v & 0xff )
                 buf.Write([]byte(" "))
                 s -= 8
             }
             //fmt.Printf( "reminings bits=%d\n", s + n
-            val &= ((1 << (s + n)) -1)
+            val &= ((1 << uint(s + n)) -1)
             fmt.Fprintf( &buf, "%0*b", s + n, val )
         }
         i += nBits
@@ -1293,36 +1314,12 @@ func (jpg *JpegDesc) getBits( startByte, val uint, startBit, nBits uint8 ) strin
     }
     return buf.String()
 }
-//MCU=0 comp=0 du=0,0 offset=0x269 [0xf5       00111---] Huffman: size 7 (0-runlength 0)
-//MCU=0 comp=0 du=0,0 offset=0x26a [0xf512     -----101 0001----] DC: decoded=81 cumulative=81
 
 func (jpg *JpegDesc) processECS( nMCUs uint) (uint, error) {
 
     scan := jpg.getCurrentScan()
     if scan == nil { panic("Internal error (no scan for ECS)\n") }
-/*
-type DCTRow         [][64]int   // dequantizised DCT matrices (yet to inverse)
 
-type scanComp struct {
-    hDC, hAC        *hcnode     // huffman roots for DC and AC coefficients
-                                // use hDC for 1st sample, hAC for all others
-    dUnits          [][64]int   // up to vSF rows of hSF data units (64 int)
-    DCTdata         []DCTRow    // rows of reordered DCT matrices
-    previousDC      int         // previous DC value for this component
-    nUnitsRow       uint        // n units per row = nSamplesLines/8
-    hSF, vSF        uint        // horizontal & vertical sampling factors
-    dUCol           uint        // increments with each dUI till it reaches hSF
-    dURow           uint        // increments with each row till it reaches vSF
-    dUAnchor        uint        // top-left corner of dUnits area, incremented
-                                // by hSF each time hSF*vSF data units are done
-    nRows           uint        // number of rows already processed
-    count           uint8       // current sample count [0-63] in each data unit
-}
-
-type mcuDesc struct {           // Minimum Coded Unit Descriptor
-    sComps           []scanComp // one per scan component in order: Y, [Cb, Cr]
-}
-*/
     /*  after ach RST, reset previousDC, dUAnchor, dUCol, dURow & count
         for each scan component (Y[,Cb,Cr]) */
     for i := len(scan.mcuD.sComps)-1; i >= 0; i-- {
@@ -1382,13 +1379,10 @@ type mcuDesc struct {           // Minimum Coded Unit Descriptor
     tLen := uint(len( jpg.data ))
     i := jpg.offset
 
-//    fmt.Printf("Ready for first data unit: component %d anchor %d row %d col %d\n",
-//               sCompIndex, sComp.dUAnchor, sComp.dURow, sComp.dUCol)
-//    fmt.Printf("%d data units per row for component %d\n", sComp.nUnitsRow, sCompIndex )
     var huffbits uint8                  // number of bits encoding value (limited to 16)
     var huffval uint                    // decoded value
 
-// for pretty print formatting:
+    // for pretty print formatting:
     var startByte = i                   // offset of the first byte contributing to code
     var startBit uint8                  // bit offset into startByte
 
@@ -1396,9 +1390,7 @@ encodedLoop:
     for ; i < tLen-1; i ++ {
         curByte = jpg.data[i]           // load next byte
         nBits = 8                       // 8 bits now available in curByte
-//        if jpg.Mcu && jpg.Begin <= nMCUs && jpg.End >= nMCUs {
-//            fmt.Printf("[MCU=%d offset=%#x.%d] ==> Loaded 0x%02x\n", nMCUs, i, 8-nBits, curByte)
-//        }
+
         if curByte == 0xFF {
             i++         // skip expected following 0x00
             if i >= tLen-1 || jpg.data[i] != 0x00 {
@@ -1428,7 +1420,6 @@ encodedLoop:
                 }
                 break                   // return condition
             }
-//            fmt.Printf("Skipped 0x00 following 0xFF\n")
         }
         for {                           // curbyte bit loop
             if huffman {
@@ -1495,11 +1486,11 @@ encodedLoop:
                                     nMCUs, sCompIndex, sComp.dURow, sComp.dUCol,
                                     jpg.getBits( startByte, code, startBit, size ),
                                     decodedDC, sComp.previousDC )
-//                        fmt.Printf( "[MCU=%d offset=%#x.%d component=%d] DC: size=0x%x, code=%#b (%#02x), decodedDC=%d cumulative DC=%d\n",
-//                                    nMCUs, i, 8-nBits, sCompIndex, size, code, code, decodedDC, sComp.previousDC )
+//  fmt.Printf( "[MCU=%d offset=%#x.%d component=%d] DC: size=0x%x, code=%#b (%#02x), decodedDC=%d cumulative DC=%d\n",
+//              nMCUs, i, 8-nBits, sCompIndex, size, code, code, decodedDC, sComp.previousDC )
                     }
-                    // store fixed DC in first slot of current data unit
-                    (*dUnit)[0] = sComp.previousDC
+
+                    (*dUnit)[0] = sComp.previousDC  // store in first slot of current data unit
 
                     startBit += size
                     sComp.count = 1         // 1 sample (DC) processed
@@ -1580,9 +1571,6 @@ encodedLoop:
                             if sComp.dURow >= sComp.vSF {
                                 sComp.dURow = 0     // end of current component
                                 sComp.dUAnchor += sComp.hSF // ready for next du
-//                                fmt.Printf("+++ Next anchor for component %d: %d\n",
-//                                            sCompIndex, sComp.dUAnchor )
-                                //panic ("Debug\n" )
                                 sCompIndex++
                                 if sCompIndex >= len(scan.mcuD.sComps) {
                                     sCompIndex = 0
@@ -1599,9 +1587,9 @@ encodedLoop:
 
                                         sc := &scan.mcuD.sComps[sci]
                                         for i := uint(0); i < sc.vSF; i ++ {
-                                            sc.DCTdata = append( sc.DCTdata, DCTRow{} )
-                                            dctRow := len(sc.DCTdata) - 1
-                                            sc.DCTdata[dctRow] = append( sc.DCTdata[dctRow], sc.dUnits[
+                                            sc.iDCTdata = append( sc.iDCTdata, iDCTRow{} )
+                                            dctRow := len(sc.iDCTdata) - 1
+                                            sc.iDCTdata[dctRow] = append( sc.iDCTdata[dctRow], sc.dUnits[
                                                (i*sc.nUnitsRow/sc.vSF) :
                                                (i*sc.nUnitsRow/sc.vSF)+(sc.nUnitsRow/sc.vSF)]... )
                                             sc.nRows++
@@ -1747,6 +1735,31 @@ var zigZagRowCol = [8][8]int{{  0,  1,  5,  6, 14, 15, 27, 28 },
                              { 21, 34, 37, 47, 50, 56, 59, 61 },
                              { 35, 36, 48, 49, 57, 58, 62, 63 }}
 
+func (jpg *JpegDesc)printQuantizationMatrix( pq, tq uint ) {
+
+    fmt.Printf( "  Zig-Zag: " )
+    var f string
+    if pq != 0 { f = "%5d " } else { f = "%3d " }
+
+    for i := 0; ;  {
+        for j := 0; j < 8; j++ {
+            fmt.Printf( f, jpg.qdefs[tq].values[i+j] )
+        }
+        i += 8
+        if i == 64 { break }
+        fmt.Printf( "\n           " )
+    }
+    fmt.Printf( "\n" )
+
+    for i := 0; i < 8; i++ {
+        fmt.Printf( "  Row %d: [ ", i )
+        for j := 0; j < 8; j++ {
+            fmt.Printf( f, jpg.qdefs[tq].values[zigZagRowCol[i][j]] )
+        }
+        fmt.Printf("]\n")
+    }
+}
+
 func (jpg *JpegDesc)defineQuantizationTable( tag, sLen uint ) ( err error ) {
 
     end := jpg.offset + 2 + sLen
@@ -1784,34 +1797,8 @@ func (jpg *JpegDesc)defineQuantizationTable( tag, sLen uint ) ( err error ) {
             if ! jpg.Content {
                 fmt.Printf( "Quantization table for destination %d\n", tq )
             }
-            fmt.Printf( "  Zig-Zag: " )
-            var f string
-            if pq != 0 {
-                f = "%5d "
-            } else {
-                f = "%3d "
-            }
-
-            for i := 0; ;  {
-                for j := 0; j < 8; j++ {
-                    fmt.Printf( f, jpg.qdefs[tq].values[i+j] )
-                }
-                i += 8
-                if i == 64 { break }
-                fmt.Printf( "\n           " )
-            }
-            fmt.Printf( "\n" )
-
-            for i := 0; i < 8; i++ {
-                fmt.Printf( "  Row %d: [ ", i )
-                for j := 0; j < 8; j++ {
-                    fmt.Printf( f, jpg.qdefs[tq].values[zigZagRowCol[i][j]] )
-                }
-                fmt.Printf("]\n")
-            }
-
+            jpg.printQuantizationMatrix( pq, tq )
         }
-//        offset += 65 + 64 * pq
         if offset >= end {
             break
         }
@@ -1891,6 +1878,31 @@ func printTree( root *hcnode, indent string ) {
     printNodes( root )
 }
 
+func (jpg *JpegDesc)printHuffmanTable( td uint ) {
+
+    fmt.Printf( "code lengths and symbols:\n" )
+
+    var nSymbols uint
+    for i := 0; i < 16; i++ {
+        if jpg.hdefs[td].cdefs[i].length == 0 { continue }
+
+        nSymbols += jpg.hdefs[td].cdefs[i].length
+        fmt.Printf( "    length %2d: %3d symbols: [ ",
+                    i+1, jpg.hdefs[td].cdefs[i].length )
+VALUE_LOOP:
+        for j := uint(0); ;  {
+            for k := uint(0); k < 8; k++ {
+                if j+k >= jpg.hdefs[td].cdefs[i].length { break VALUE_LOOP }
+                fmt.Printf( "0x%02x ", jpg.hdefs[td].cdefs[i].values[j+k] )
+            }
+            fmt.Printf("\n                              ")
+            j += 8
+        }
+        fmt.Printf( "]\n" )
+    }
+    fmt.Printf("    Total number of symbols: %d\n", nSymbols )
+}
+
 func (jpg *JpegDesc)defineHuffmanTable( tag, sLen uint ) ( err error ) {
 
     end := jpg.offset + 2 + sLen
@@ -1931,26 +1943,7 @@ func (jpg *JpegDesc)defineHuffmanTable( tag, sLen uint ) ( err error ) {
             if ! jpg.Content {
                 fmt.Printf( "Huffman table class %s destination %d ", class, th )
             }
-            var nSymbols uint
-            fmt.Printf( "code lengths and symbols:\n" )
-            for i := 0; i < 16; i++ {
-                if jpg.hdefs[td].cdefs[i].length == 0 { continue }
-
-                nSymbols += jpg.hdefs[td].cdefs[i].length
-                fmt.Printf( "    length %2d: %3d symbols: [ ",
-                            i+1, jpg.hdefs[td].cdefs[i].length )
-VALUES_LOOP:
-                for j := uint(0); ;  {
-                    for k := uint(0); k < 8; k++ {
-                        if j+k >= jpg.hdefs[td].cdefs[i].length { break VALUES_LOOP }
-                        fmt.Printf( "0x%02x ", jpg.hdefs[td].cdefs[i].values[j+k] )
-                    }
-                    fmt.Printf("\n                              ")
-                    j += 8
-                }
-                fmt.Printf( "]\n" )
-            }
-            fmt.Printf("    Total number of symbols: %d\n", nSymbols )
+            jpg.printHuffmanTable( td )
         }
 
         if jpg.Codes {
@@ -1988,11 +1981,11 @@ func (jpg *JpegDesc)numberOfLines( tag, sLen uint ) ( err error ) {
     if sLen != 4 {   // fixed size
         return fmt.Errorf( "numberOfLines: Wrong DNL header (len %d)\n", sLen )
     }
-    if jpg.DNL {
+    if jpg.pDNL {
         return fmt.Errorf( "numberOfLines: Multiple DNL tables\n" )
     }
 
-    jpg.DNL = true
+    jpg.pDNL = true
     offset := jpg.offset + 4
 
     var nLines uint
@@ -2000,7 +1993,7 @@ func (jpg *JpegDesc)numberOfLines( tag, sLen uint ) ( err error ) {
         nLines = uint(jpg.data[offset]) << 8 + uint(jpg.data[offset+1])
         fmt.Printf( "  Number of Lines: %d\n", nLines )
     }
-    jpg.DNLnLines = nLines
+    jpg.gDNLnLines = nLines
 
     // find SOFn segment, which is the last table in global tables
     sof := jpg.getLastGlobalTable()
@@ -2083,13 +2076,14 @@ func (jpg *JpegDesc)printMarker( tag, sLen, offset uint ) {
 
 /*
     Analyse analyses jpeg data and splits the data into well-known segments.
-    The argument toDo indicates what information ahhould be printed during
+    The argument toDo indicates what information should be printed during
     analysis. The argument doDo.Fix, if true, indicates that some common issues
     in jpeg data be fixed as much as possible during analysis and updated in
     memory.
-    It returns a tuple: a pointer to a JpegDesc containing the segment
-    definitions and an error. In all cases, nil error or not, the returned
-    JpegDesc is usable (but wont be complete in case of error).
+
+    It returns a tuple: a pointer to a JpegDesc containing segment definitions
+    and an error. In all cases, nil error or not, the returned JpegDesc is
+    usable (but wont be complete in case of error).
 */
 func Analyze( data []byte, toDo *Control ) ( *JpegDesc, error ) {
 
@@ -2100,14 +2094,14 @@ func Analyze( data []byte, toDo *Control ) ( *JpegDesc, error ) {
     if ! bytes.Equal( data[0:4],  []byte{ 0xff, 0xd8, 0xff, 0xe0 } ) {
 		return jpg, fmt.Errorf( "Analyse: Wrong signature 0x%x for a JPEG file\n", data[0:4] )
 	}
-    tLen := uint(len(data))
 
-markerLoop:
+    tLen := uint(len(data))
     for i := uint(0); i < tLen; {
         tag := uint(data[i]) << 8 + uint(data[i+1])
         sLen := uint(0)       // case of a segment without any data
 
         switch tag {
+// TODO: add comments
         case _SOI:            // no data, no length
             jpg.printMarker( tag, sLen, i )
             if jpg.state != _INIT {
@@ -2197,7 +2191,7 @@ markerLoop:
             jpg.state = _FINAL
             jpg.offset = i + 2  // points after the last byte
             if jpg.Fix { jpg.fixLines( ) }
-            break markerLoop
+            break
         }
         i += sLen + 2
         jpg.offset = i          // always points at the mark
@@ -2205,13 +2199,13 @@ markerLoop:
     return jpg, nil
 }
 
-// IsComplete returns true if the resulting JPEG data makes a complete JPEG file.
-// It does not guarantee that the data is a valid JPEG image
+// IsComplete returns true if the current JPEG data makes a complete JPEG file.
+// It does not guarantee that the data corresponds to a valid JPEG image
 func (jpg *JpegDesc) IsComplete( ) bool {
     return jpg.state == _FINAL
 }
 
-func (jpg *JpegDesc)WriteSegment( w io.Writer, s *segment ) (written int, err error) {
+func (jpg *JpegDesc)writeSegment( w io.Writer, s *segment ) (written int, err error) {
     if s.from == original {
         written, err = w.Write( jpg.data[s.start:s.stop] )
     } else {
@@ -2230,19 +2224,19 @@ func (jpg *JpegDesc)flatten( w io.Writer ) (int, error) {
 
     var n int
     for index := range( jpg.tables )  {
-        n, err = jpg.WriteSegment( w, &jpg.tables[index] )
+        n, err = jpg.writeSegment( w, &jpg.tables[index] )
         written += n
         if err != nil { return  written,jpgForwardError( "flatten", err ) }
     }
 
     for scanIndex := range( jpg.scans ) {
         for tableIndex := range( jpg.scans[scanIndex].tables ) {
-            n, err = jpg.WriteSegment( w, &jpg.scans[scanIndex].tables[tableIndex] )
+            n, err = jpg.writeSegment( w, &jpg.scans[scanIndex].tables[tableIndex] )
             written += n
             if err != nil { return written, jpgForwardError( "flatten", err ) }
         }
         for ECSIndex := range( jpg.scans[scanIndex].ECSs ) {
-            n, err = jpg.WriteSegment( w, &jpg.scans[scanIndex].ECSs[ECSIndex] )
+            n, err = jpg.writeSegment( w, &jpg.scans[scanIndex].ECSs[ECSIndex] )
             written += n
             if err != nil { return written, jpgForwardError( "flatten", err ) }
         }
@@ -2254,7 +2248,7 @@ func (jpg *JpegDesc)flatten( w io.Writer ) (int, error) {
     return written, nil
 }
 
-// GetActualLengths returns a tuple: the number of bytes between SOI and EOI (both included)
+// GetActualLengths returns the number of bytes between SOI and EOI (both included)
 // in the possibly fixed jpeg data, and the original data length. The data length may be
 // different if the analysis stopped in error, issues have been fixed or if there is some
 // garbage at the end that should be ignored.
@@ -2266,6 +2260,7 @@ func (jpg *JpegDesc) GetActualLengths( ) ( uint, uint ) {
     return uint(size), dataSize
 }
 
+// Generate returns a copy in memory of the possibly fixed jpeg file after analysis.
 func (jpg *JpegDesc) Generate( ) ( []byte, error ) {
     var b bytes.Buffer
     _, err := jpg.flatten( &b )
@@ -2273,7 +2268,7 @@ func (jpg *JpegDesc) Generate( ) ( []byte, error ) {
     return b.Bytes(), nil
 }
 
-// Write stores the possibly updated JEPG data into a file.
+// Write stores the possibly fixed JEPG data into a file.
 // The argument path is the new file path.
 // If the file exists already, new content will replace the existing one.
 func (jpg *JpegDesc)Write( path string ) error {
@@ -2291,11 +2286,7 @@ func (jpg *JpegDesc)Write( path string ) error {
     return nil
 }
 
-type Metadata struct {
-    SampleSize      uint
-    Width, Height   uint
-}
-
+// GetMetadata returns the sample size (precision) and image size (width, height).
 func (jpg *JpegDesc)GetMetadata( ) Metadata {
     var result Metadata
     result.SampleSize = jpg.resolution.samplePrecision
@@ -2304,17 +2295,14 @@ func (jpg *JpegDesc)GetMetadata( ) Metadata {
     return result
 }
 
-type Control struct {
-    Markers, Content, Quantizers, Lengths, Codes, Mcu, Du, Fix   bool
-    Begin, End  uint
-}
 /*
     ReadJpeg reads a JPEG file in memory, and starts analysing its content.
     The argument path is the existing file path.
     The argument toDo provides information about how to analyse the document
     If toDo.Fix is true, ReadJped fixes some common issues in jpeg data by
     writing the modified data in memory, so that they can be stored later by
-    calling Write or generate.
+    calling Write or Generate.
+
     It returns a tuple: a pointer to a JpegDesc containing the segment
     definitions and an error. If the file cannot be read the returned JpegDesc
     is nil.
