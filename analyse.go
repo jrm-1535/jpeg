@@ -97,23 +97,6 @@ func (jpg *JpegDesc) getJPEGStateName( ) string {
     return names[ jpg.state ]
 }
 
-type Control struct {
-    Markers         bool    // show JPEG markers as they are parsed
-    Content         bool    // display content of JPEG segments
-    Quantizers      bool    // display quantization matrices as defined
-    Lengths         bool    // display huffman table (code length & symbols)
-    Codes           bool    // display huffman code for each symbol
-    Mcu             bool    // display MCUs as they are parsed
-    Du              bool    // display each DU resulting from MCU parsing
-    Fix             bool    // try and fix errors if possible
-    Begin, End      uint    // control MCU &DU display (from begin to end, included)
-}
-
-type Metadata struct {
-    SampleSize      uint    // number of bits per pixel
-    Width, Height   uint    // image size in pixels
-}
-
 type source uint                // whether segment is from raw data or has been modified after fixing
 
 const (
@@ -347,7 +330,7 @@ func (jpg *JpegDesc) getCurrentScan() *scan {
 
 func (jpg *JpegDesc)addECS( start, stop uint, from source, nMcus uint ) error {
     if jpg.state != _SCAN1_ECS && jpg.state != _SCANn_ECS {
-        return fmt.Errorf( "addECS: Wrong state %d for ECS\n", jpg.getJPEGStateName() )
+        return fmt.Errorf( "addECS: Wrong state %s for ECS\n", jpg.getJPEGStateName() )
     }
     scan := jpg.getCurrentScan()
     if scan == nil || scan.tables == nil {  // at least SOS in scan.tables
@@ -2074,12 +2057,37 @@ func (jpg *JpegDesc)printMarker( tag, sLen, offset uint ) {
     }
 }
 
+type Control struct {
+    Markers         bool    // show JPEG markers as they are parsed
+    Content         bool    // display content of JPEG segments
+    Quantizers      bool    // display quantization matrices as defined
+    Lengths         bool    // display huffman table (code length & symbols)
+    Codes           bool    // display huffman code for each symbol
+    Mcu             bool    // display MCUs as they are parsed
+    Du              bool    // display each DU resulting from MCU parsing
+    Fix             bool    // try and fix errors if possible
+    Begin, End      uint    // control MCU &DU display (from begin to end, included)
+}
+
 /*
     Analyse analyses jpeg data and splits the data into well-known segments.
     The argument toDo indicates what information should be printed during
     analysis. The argument doDo.Fix, if true, indicates that some common issues
     in jpeg data be fixed as much as possible during analysis and updated in
     memory.
+
+    What can be fixed:
+
+    - if the last RSTn is ending a scan it is not necessary and it may cause a
+    renderer to fail. It is removed from the scan.
+
+    - if a DNL table is found after an ECS and if the number of lines given in
+    the SOFn table was 0, the number of lines found in DNL is set in the SOFn
+    and in metadata and the DNL table is removed
+
+    - if the number of lines calculated from the scan data is different from
+    the SOFn value, the SOFn value and metadata are updated (this is done after
+    DNL processing).
 
     It returns a tuple: a pointer to a JpegDesc containing segment definitions
     and an error. In all cases, nil error or not, the returned JpegDesc is
@@ -2139,7 +2147,7 @@ func Analyze( data []byte, toDo *Control ) ( *JpegDesc, error ) {
         case _DHP, _EXP:  // Define Hierarchical Progression, Expand reference image
             sLen = uint(data[i+2]) << 8 + uint(data[i+3])
             jpg.printMarker( tag, sLen, i )
-            return jpg, fmt.Errorf( "Analyse: Unsupported hierarchical table 5s\n", getJPEGTagName(tag) )
+            return jpg, fmt.Errorf( "Analyse: Unsupported hierarchical table %s\n", getJPEGTagName(tag) )
 
         case _DNL:
             sLen = uint(data[i+2]) << 8 + uint(data[i+3])
@@ -2199,10 +2207,56 @@ func Analyze( data []byte, toDo *Control ) ( *JpegDesc, error ) {
     return jpg, nil
 }
 
+/*
+    ReadJpeg reads a JPEG file in memory, and starts analysing its content.
+    The argument path is the existing file path.
+    The argument toDo provides information about how to analyse the document
+    If toDo.Fix is true, ReadJped fixes some common issues in jpeg data by
+    writing the modified data in memory, so that they can be stored later by
+    calling Write or Generate.
+
+    It returns a tuple: a pointer to a JpegDesc containing the segment
+    definitions and an error. If the file cannot be read the returned JpegDesc
+    is nil.
+*/
+func ReadJpeg( path string, toDo *Control ) ( *JpegDesc, error ) {
+    data, err := ioutil.ReadFile( path )
+    if err != nil {
+		return nil, fmt.Errorf( "ReadJpeg: Unable to read file %s: %v\n", path, err )
+	}
+    return Analyze( data, toDo )
+}
+
 // IsComplete returns true if the current JPEG data makes a complete JPEG file.
 // It does not guarantee that the data corresponds to a valid JPEG image
 func (jpg *JpegDesc) IsComplete( ) bool {
     return jpg.state == _FINAL
+}
+
+type Metadata struct {
+    SampleSize      uint    // number of bits per pixel
+    Width, Height   uint    // image size in pixels
+}
+
+// GetMetadata returns the sample size (precision) and image size (width, height).
+func (jpg *JpegDesc)GetMetadata( ) Metadata {
+    var result Metadata
+    result.SampleSize = jpg.resolution.samplePrecision
+    result.Width = jpg.resolution.nSamplesLine
+    result.Height = jpg.resolution.nLines
+    return result
+}
+
+// GetActualLengths returns the number of bytes between SOI and EOI (both included)
+// in the possibly fixed jpeg data, and the original data length. The data length may be
+// different if the analysis stopped in error, issues have been fixed or if there is some
+// garbage at the end that should be ignored.
+func (jpg *JpegDesc) GetActualLengths( ) ( uint, uint ) {
+
+    dataSize := uint( len( jpg.data ) )
+    if ! jpg.IsComplete() { return 0, dataSize }
+    size, err := jpg.flatten( ioutil.Discard ); if err != nil { return 0, dataSize }
+    return uint(size), dataSize
 }
 
 func (jpg *JpegDesc)writeSegment( w io.Writer, s *segment ) (written int, err error) {
@@ -2248,18 +2302,6 @@ func (jpg *JpegDesc)flatten( w io.Writer ) (int, error) {
     return written, nil
 }
 
-// GetActualLengths returns the number of bytes between SOI and EOI (both included)
-// in the possibly fixed jpeg data, and the original data length. The data length may be
-// different if the analysis stopped in error, issues have been fixed or if there is some
-// garbage at the end that should be ignored.
-func (jpg *JpegDesc) GetActualLengths( ) ( uint, uint ) {
-
-    dataSize := uint( len( jpg.data ) )
-    if ! jpg.IsComplete() { return 0, dataSize }
-    size, err := jpg.flatten( ioutil.Discard ); if err != nil { return 0, dataSize }
-    return uint(size), dataSize
-}
-
 // Generate returns a copy in memory of the possibly fixed jpeg file after analysis.
 func (jpg *JpegDesc) Generate( ) ( []byte, error ) {
     var b bytes.Buffer
@@ -2284,34 +2326,5 @@ func (jpg *JpegDesc)Write( path string ) error {
 
     if err = f.Close( ); err != nil { return jpgForwardError( "Write", err ) }
     return nil
-}
-
-// GetMetadata returns the sample size (precision) and image size (width, height).
-func (jpg *JpegDesc)GetMetadata( ) Metadata {
-    var result Metadata
-    result.SampleSize = jpg.resolution.samplePrecision
-    result.Width = jpg.resolution.nSamplesLine
-    result.Height = jpg.resolution.nLines
-    return result
-}
-
-/*
-    ReadJpeg reads a JPEG file in memory, and starts analysing its content.
-    The argument path is the existing file path.
-    The argument toDo provides information about how to analyse the document
-    If toDo.Fix is true, ReadJped fixes some common issues in jpeg data by
-    writing the modified data in memory, so that they can be stored later by
-    calling Write or Generate.
-
-    It returns a tuple: a pointer to a JpegDesc containing the segment
-    definitions and an error. If the file cannot be read the returned JpegDesc
-    is nil.
-*/
-func ReadJpeg( path string, toDo *Control ) ( *JpegDesc, error ) {
-    data, err := ioutil.ReadFile( path )
-    if err != nil {
-		return nil, fmt.Errorf( "ReadJpeg: Unable to read file %s: %w\n", path, err )
-	}
-    return Analyze( data, toDo )
 }
 
