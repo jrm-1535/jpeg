@@ -1,4 +1,4 @@
-// Package jepg provides a few primitives to parse and analyse a JPEG image
+// Package jpeg provides a few primitives to parse and analyse a JPEG image
 package jpeg
 
 import (
@@ -238,8 +238,9 @@ const (                 // JPEG Marker Definitions
     _EXP   = 0xffdf     // Expand reference image
 
     _APP0  = 0xffe0     // Application Vendor Specific #0 (JFIF)
-    _APP2  = 0xffe2     // Application Vendor Specific #2
-    _APP3  = 0xffe3     // Application Vendor Specific #3
+    _APP1  = 0xffe1     // Application Vendor Specific #1 (EXIF, TIFF, DCF, TIFF/EP, Adobe XMP)
+    _APP2  = 0xffe2     // Application Vendor Specific #2 (ICC)
+    _APP3  = 0xffe3     // Application Vendor Specific #3 (META)
     _APP4  = 0xffe4     // Application Vendor Specific #4
     _APP5  = 0xffe5     // Application Vendor Specific #5
     _APP6  = 0xffe6     // Application Vendor Specific #6
@@ -248,13 +249,32 @@ const (                 // JPEG Marker Definitions
     _APP9  = 0xffe9     // Application Vendor Specific #9
     _APP10 = 0xffea     // Application Vendor Specific #10
     _APP11 = 0xffeb     // Application Vendor Specific #11
-    _APP12 = 0xffec     // Application Vendor Specific #12
-    _APP13 = 0xffed     // Application Vendor Specific #13
+    _APP12 = 0xffec     // Application Vendor Specific #12 (Picture Info, Ducky)
+    _APP13 = 0xffed     // Application Vendor Specific #13 (Photoshop Adobe IRB)
+    _APP14 = 0xffee     // Application Vendor Specific #14 (Adobe)
+    _APP15 = 0xffef     // Application Vendor Specific #15
+
+    _RES0  = 0xfff0     // Reserved for JPEG extensions #0
+    _RES1  = 0xfff1     // Reserved for JPEG extensions #1
+    _RES2  = 0xfff2     // Reserved for JPEG extensions #2
+    _RES3  = 0xfff3     // Reserved for JPEG extensions #3
+    _RES4  = 0xfff4     // Reserved for JPEG extensions #4
+    _RES5  = 0xfff5     // Reserved for JPEG extensions #5
+    _RES6  = 0xfff6     // Reserved for JPEG extensions #6
+    _RES7  = 0xfff7     // Reserved for JPEG extensions #7
+    _RES8  = 0xfff8     // Reserved for JPEG extensions #8
+    _RES9  = 0xfff9     // Reserved for JPEG extensions #9
+    _RES10 = 0xfffa     // Reserved for JPEG extensions #10
+    _RES11 = 0xfffb     // Reserved for JPEG extensions #11
+    _RES12 = 0xfffc     // Reserved for JPEG extensions #12
+    _RES13 = 0xfffd     // Reserved for JPEG extensions #13
+
     _COM   = 0xfffe     // Comment (text)
 )
 
 func getJPEGTagName( tag uint ) string {
-    if tag < _SOF0 || tag > _COM { return "Unknown JPEG tag" }
+    if tag == _TEM { return "TEM Temporary use in arithmetic coding" }
+    if tag < _SOF0 || tag > _COM { return "RES Reserved Marker" }
 
     names := [...]string {
         "SOF0 Start Of Frame Huffman-coding frames (Baseline DCT)",
@@ -292,8 +312,9 @@ func getJPEGTagName( tag uint ) string {
         "EXP Expand reference image",
 
         "APP0 Application Vendor Specific #0 (JFIF)",
-        "APP2 Application Vendor Specific #2",
-        "APP3 Application Vendor Specific #3",
+        "APP1 Application Vendor Specific #1 (EXIF, TIFF, DCF, TIFF/EP, Adobe XMP)",
+        "APP2 Application Vendor Specific #2 (ICC)",
+        "APP3 Application Vendor Specific #3 (META)",
         "APP4 Application Vendor Specific #4",
         "APP5 Application Vendor Specific #5",
         "APP6 Application Vendor Specific #6",
@@ -302,8 +323,27 @@ func getJPEGTagName( tag uint ) string {
         "APP9 Application Vendor Specific #9",
         "APP10 Application Vendor Specific #10",
         "APP11 Application Vendor Specific #11",
-        "APP12 Application Vendor Specific #12",
-        "APP13 Application Vendor Specific #13",  }
+        "APP12 Application Vendor Specific #12 (Picture Info, Ducky)",
+        "APP13 Application Vendor Specific #13 (Photoshop Adobe IRB)",
+        "APP14 Application Vendor Specific #14 (Adobe)",
+
+        "RES0 Reserved for JPEG extensions #0",
+        "RES1 Reserved for JPEG extensions #1",
+        "RES2 Reserved for JPEG extensions #2",
+        "RES3 Reserved for JPEG extensions #3",
+        "RES4 Reserved for JPEG extensions #4",
+        "RES5 Reserved for JPEG extensions #5",
+        "RES6 Reserved for JPEG extensions #6",
+        "RES7 Reserved for JPEG extensions #7",
+        "RES8 Reserved for JPEG extensions #8",
+        "RES9 Reserved for JPEG extensions #9",
+        "RES10 Reserved for JPEG extensions #10",
+        "RES11 Reserved for JPEG extensions #11",
+        "RES12 Reserved for JPEG extensions #12",
+        "RES13 Reserved for JPEG extensions #13",
+
+        "COM Comment",
+  }
 
     return names[ tag - _SOF0 ]
 }
@@ -1953,19 +1993,31 @@ func (jpg *JpegDesc)defineHuffmanTable( tag, sLen uint ) ( err error ) {
     return jpg.addTable( tag, jpg.offset, end, original )
 }
 
-func (jpg *JpegDesc)numberOfLines( tag, sLen uint ) ( err error ) {
+func (jpg *JpegDesc)commentSegment( tag, sLen uint ) error {
+    if jpg.Content {
+        offset := jpg.offset
+        var b bytes.Buffer
+        s := jpg.data[offset:offset+sLen]
+        b.Write( s )
+        fmt.Printf( "COM\n" )
+        fmt.Printf( "  %s\n", b.String() )
+    }
+    return nil
+}
+
+func (jpg *JpegDesc)defineNumberOfLines( tag, sLen uint ) ( err error ) {
     if jpg.Content {
         fmt.Printf( "DNL\n" )
     }
     if jpg.state != _SCANn {
-        return fmt.Errorf( "numberOfLines: Wrong sequence %s in state %s\n",
+        return fmt.Errorf( "defineNumberOfLines: Wrong sequence %s in state %s\n",
                        getJPEGTagName(tag), jpg.getJPEGStateName() )
     }
     if sLen != 4 {   // fixed size
-        return fmt.Errorf( "numberOfLines: Wrong DNL header (len %d)\n", sLen )
+        return fmt.Errorf( "defineNumberOfLines: Wrong DNL header (len %d)\n", sLen )
     }
     if jpg.pDNL {
-        return fmt.Errorf( "numberOfLines: Multiple DNL tables\n" )
+        return fmt.Errorf( "defineNumberOfLines: Multiple DNL tables\n" )
     }
 
     jpg.pDNL = true
@@ -2001,7 +2053,7 @@ func (jpg *JpegDesc)numberOfLines( tag, sLen uint ) ( err error ) {
                     prevLines, nLines)
     } else {
         if ( prevLines != 0 ) {
-            return fmt.Errorf( "numberOfLines: DNL table found with non 0 SOF number of lines (%d)\n",
+            return fmt.Errorf( "defineNumberOfLines: DNL table found with non 0 SOF number of lines (%d)\n",
                                 prevLines )
         }
 
@@ -2109,7 +2161,7 @@ func Analyze( data []byte, toDo *Control ) ( *JpegDesc, error ) {
         sLen := uint(0)       // case of a segment without any data
 
         switch tag {
-// TODO: add comments
+
         case _SOI:            // no data, no length
             jpg.printMarker( tag, sLen, i )
             if jpg.state != _INIT {
@@ -2118,77 +2170,10 @@ func Analyze( data []byte, toDo *Control ) ( *JpegDesc, error ) {
             }
             jpg.state = _APPLICATION
 
-        case _APP0:           // data follows tag & length
-            sLen = uint(data[i+2]) << 8 + uint(data[i+3])
-            jpg.printMarker( tag, sLen, i )
-            err := jpg.app0( tag, sLen )
-            if err != nil { return jpg, jpgForwardError( "Analyze", err ) }
-
-        case _SOF0, _SOF1, _SOF2, _SOF3, _SOF5, _SOF6, _SOF7, _SOF9, _SOF10, _SOF11, _SOF13, _SOF14, _SOF15:
-            sLen = uint(data[i+2]) << 8 + uint(data[i+3])
-            jpg.printMarker( tag, sLen, i )
-            err := jpg.startOfFrame( tag, sLen )
-            if err != nil { return jpg, jpgForwardError( "Analyze", err ) }
-
-        case _SOS:
-            sLen = uint(data[i+2]) << 8 + uint(data[i+3])
-            jpg.printMarker( tag, sLen, i )
-
-            err := jpg.processScan( tag, sLen )
-            if err != nil { return jpg, jpgForwardError( "Analyse", err ) }
-            i = jpg.offset          // jpg.offset has been updated
-            continue
-
-        case _TEM, _RST0, _RST1, _RST2, _RST3, _RST4, _RST5, _RST6, _RST7: // empty segment, no following length
+        case _RST0, _RST1, _RST2, _RST3, _RST4, _RST5, _RST6, _RST7: // empty segment, no following length
             jpg.printMarker( tag, sLen, i )
             return jpg, fmt.Errorf ("Analyse: Marker %s hould not happen in top level segments\n",
                                      getJPEGTagName(tag) )
-
-        case _DHP, _EXP:  // Define Hierarchical Progression, Expand reference image
-            sLen = uint(data[i+2]) << 8 + uint(data[i+3])
-            jpg.printMarker( tag, sLen, i )
-            return jpg, fmt.Errorf( "Analyse: Unsupported hierarchical table %s\n", getJPEGTagName(tag) )
-
-        case _DNL:
-            sLen = uint(data[i+2]) << 8 + uint(data[i+3])
-            jpg.printMarker( tag, sLen, i )
-
-            err := jpg.numberOfLines( tag, sLen )
-            if err != nil { return jpg, jpgForwardError( "Analyse", err ) }
-
-        case  _DRI:  // Define Restart Interval
-            sLen = uint(data[i+2]) << 8 + uint(data[i+3])
-            jpg.printMarker( tag, sLen, i )
-            err := jpg.defineRestartInterval( tag, sLen )
-            if err != nil { return jpg, jpgForwardError( "Analyse", err ) }
-
-// TODO: recombine all those cases with a common call that dispatches to proper func
-        case _DHT:  // _DHT (Huffman)
-            sLen = uint(data[i+2]) << 8 + uint(data[i+3])
-            jpg.printMarker( tag, sLen, i )
-            err := jpg.defineHuffmanTable( tag, sLen )
-            if err != nil { return jpg, jpgForwardError( "Analyse", err ) }
-            if jpg.state == _APPLICATION {
-                jpg.state = _FRAME
-            }
-
-        case _DQT:  // _DQT (Quantization)
-            sLen = uint(data[i+2]) << 8 + uint(data[i+3])
-            jpg.printMarker( tag, sLen, i )
-            err := jpg.defineQuantizationTable( tag, sLen )
-            if err != nil { return jpg, jpgForwardError( "Analyze", err ) }
-            if jpg.state == _APPLICATION {
-                jpg.state = _FRAME
-            }
-
-        default:    // _DAC (Arithmetic), _COM (comment)
-            sLen = uint(data[i+2]) << 8 + uint(data[i+3])
-            jpg.printMarker( tag, sLen, i )
-            err := jpg.addTable( tag, jpg.offset, jpg.offset + 2 + sLen, original )
-            if err != nil { return jpg, jpgForwardError( "Analyse", err ) }
-            if jpg.state == _APPLICATION {
-                jpg.state = _FRAME
-            }
 
         case _EOI:
             jpg.printMarker( tag, sLen, i )
@@ -2200,6 +2185,59 @@ func Analyze( data []byte, toDo *Control ) ( *JpegDesc, error ) {
             jpg.offset = i + 2  // points after the last byte
             if jpg.Fix { jpg.fixLines( ) }
             break
+
+        default:        // all other cases have data following tag & length
+            sLen = uint(data[i+2]) << 8 + uint(data[i+3])
+            jpg.printMarker( tag, sLen, i )
+            var err error
+
+            switch tag {    // second level tag switching within the first default
+            case _APP0:
+                err = jpg.app0( tag, sLen )
+
+            case _APP1, _APP2, _APP3, _APP4, _APP5, _APP6, _APP7, _APP8, _APP9,
+                 _APP10, _APP11, _APP12, _APP13, _APP14, _APP15:
+
+            case _SOF0, _SOF1, _SOF2, _SOF3, _SOF5, _SOF6, _SOF7, _SOF9, _SOF10,
+                 _SOF11, _SOF13, _SOF14, _SOF15:
+                err = jpg.startOfFrame( tag, sLen )
+
+            case _DHT:  // Define Huffman Table
+                err = jpg.defineHuffmanTable( tag, sLen )
+
+            case _DQT:  // Define Quantization Table
+                err = jpg.defineQuantizationTable( tag, sLen )
+
+            case _DAC:    // Define Arithmetic coding
+                err = jpg.addTable( tag, jpg.offset, jpg.offset + 2 + sLen, original )
+
+            case _DNL:
+                err = jpg.defineNumberOfLines( tag, sLen )
+
+            case  _DRI:  // Define Restart Interval
+                err = jpg.defineRestartInterval( tag, sLen )
+
+            case _SOS:
+                err = jpg.processScan( tag, sLen )
+                if err != nil { return jpg, jpgForwardError( "Analyse", err ) }
+                i = jpg.offset          // jpg.offset has been updated
+                continue
+
+            case _COM:  // Comment
+                err = jpg.commentSegment( tag, sLen )
+
+            case _DHP, _EXP:  // Define Hierarchical Progression, Expand reference components
+                return jpg, fmt.Errorf( "Analyse: Unsupported hierarchical table %s\n",
+                                        getJPEGTagName(tag) )
+
+            default:    // All JPEG extensions and reserved tags (_JPG, _TEM, _RESn)
+                return jpg, fmt.Errorf( "Analyse: Unsupported JPEG extension or reserved tag%s\n",
+                                        getJPEGTagName(tag) )
+            }
+            if err != nil { return jpg, jpgForwardError( "Analyse", err ) }
+            if jpg.state == _APPLICATION {
+                jpg.state = _FRAME
+            }
         }
         i += sLen + 2
         jpg.offset = i          // always points at the mark
