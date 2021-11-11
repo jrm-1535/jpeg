@@ -2151,14 +2151,18 @@ func Analyze( data []byte, toDo *Control ) ( *JpegDesc, error ) {
     jpg.Control = *toDo
     jpg.data = data
 
-    if ! bytes.Equal( data[0:4],  []byte{ 0xff, 0xd8, 0xff, 0xe0 } ) {
-		return jpg, fmt.Errorf( "Analyse: Wrong signature 0x%x for a JPEG file\n", data[0:4] )
+    if ! bytes.Equal( data[0:2],  []byte{ 0xff, 0xd8 } ) {
+		return jpg, fmt.Errorf( "Analyse: Wrong signature 0x%x for a JPEG file\n", data[0:2] )
 	}
 
     tLen := uint(len(data))
     for i := uint(0); i < tLen; {
         tag := uint(data[i]) << 8 + uint(data[i+1])
         sLen := uint(0)       // case of a segment without any data
+
+        if tag < _TEM {
+		    return jpg, fmt.Errorf( "Analyse: invalid marker 0x%x\n", data[i:i+1] )
+        }
 
         switch tag {
 
