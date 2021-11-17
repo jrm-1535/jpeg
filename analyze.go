@@ -21,7 +21,7 @@ A frame can be made of multiple scans:
    optionally followed by multiple other scan segments, each without a DNL
    [optional tables]<frame header><scan segment #1>[DNL][<scan segment #2>...<last scan segment>
 Optional tables may appear immediately after SOI or immediately after frame header SOFn. They are:
-   Application data (APP0 to APP15) 1 APP required: APP0 for JFIF,
+   Application data (APP0 to APP15) 1 APP required: APP0 for JFIF, APP1 for exif
    Quantization Table (DQT), at least 1 required
    Huffman Table (DHT) required if SOF1, SOF2, SOF3, SOF5, SOD6 or SOF7,
    Arithmetic Coding Table (DAC) required if SOF9, SOF10, SOF11, SOF13, SOD14 or SOF15, and default table not used,
@@ -66,7 +66,7 @@ Example:
 
 const (                         // JPEG parsing state
     _INIT = iota                // expecting SOI
-    _APPLICATION                // from _INIT after SOI, expecting APP0 and APP0 ext
+    _APPLICATION                // from _INIT after SOI, expecting APPn (and APPn ext)
     _FRAME                      // from _APP after any table other than APP0
     _SCAN1                      // from _FRAME after SOFn, expecting DHT, DAC, DQT, DRI, COM, or SOS
     _SCAN1_ECS                  // from _SCAN1 after SOS, expecting ECSn/RStn, DHT, DAC, DQT, DRI, COM, SOS, DNL or EOI
@@ -77,7 +77,7 @@ const (                         // JPEG parsing state
 
 /* State transitions
  _INIT        -> _APPLICATION   transition on SOI
- _APPLICATION -> _FRAME         transition on any table other than APP0
+ _APPLICATION -> _FRAME         transition on any table other than APPn
  _FRAME       -> _SCAN1         transition on SOFn
  _SCAN1       -> _SCAN1_ECS     transition on SOS
  _SCAN1_ECS   -> _FINAL         transition on EOI
@@ -170,7 +170,7 @@ type sampling  struct {
     mhSF, mvSF      uint        // max horizontal and vertical sampling factors
 }
 
-type control struct {
+type control struct {           // just to keep JpegDesc opaque
                     Control
 }
 
@@ -272,9 +272,9 @@ const (                 // JPEG Marker Definitions
     _COM   = 0xfffe     // Comment (text)
 )
 
-func getJPEGTagName( tag uint ) string {
-    if tag == _TEM { return "TEM Temporary use in arithmetic coding" }
-    if tag < _SOF0 || tag > _COM { return "RES Reserved Marker" }
+func getJPEGmarkerName( marker uint ) string {
+    if marker == _TEM { return "TEM Temporary use in arithmetic coding" }
+    if marker < _SOF0 || marker > _COM { return "RES Reserved Marker" }
 
     names := [...]string {
         "SOF0 Start Of Frame Huffman-coding frames (Baseline DCT)",
@@ -326,6 +326,7 @@ func getJPEGTagName( tag uint ) string {
         "APP12 Application Vendor Specific #12 (Picture Info, Ducky)",
         "APP13 Application Vendor Specific #13 (Photoshop Adobe IRB)",
         "APP14 Application Vendor Specific #14 (Adobe)",
+        "APP15 Application Vendor Specific #15",
 
         "RES0 Reserved for JPEG extensions #0",
         "RES1 Reserved for JPEG extensions #1",
@@ -345,7 +346,7 @@ func getJPEGTagName( tag uint ) string {
         "COM Comment",
   }
 
-    return names[ tag - _SOF0 ]
+    return names[ marker - _SOF0 ]
 }
 
 func jpgForwardError( prefix string, err error ) error {
@@ -381,7 +382,7 @@ func (jpg *JpegDesc)addECS( start, stop uint, from source, nMcus uint ) error {
     return nil
 }
 
-func (jpg *JpegDesc)addTable( tag, start, stop uint, from source ) error {
+func (jpg *JpegDesc)addTable( marker, start, stop uint, from source ) error {
     table := segment{ from: from, start: start, stop: stop }
     if jpg.state == _APPLICATION || jpg.state == _FRAME {
         jpg.tables = append( jpg.tables, table )
@@ -390,119 +391,8 @@ func (jpg *JpegDesc)addTable( tag, start, stop uint, from source ) error {
         scan.tables = append( scan.tables, table )
     } else {
         return fmt.Errorf( "addTable: Wrong sequence %s in state %s\n",
-                           getJPEGTagName(tag), jpg.getJPEGStateName() )
+                           getJPEGmarkerName(marker), jpg.getJPEGStateName() )
     }
-    return nil
-}
-
-const (                             // Image resolution units (prefixed with _ to avoid being documented)
-    _DOTS_PER_ARBITRARY_UNIT = 0    // undefined unit
-    _DOTS_PER_INCH = 1              // DPI
-    _DOTS_PER_CM = 2                // DPCM Dots per centimeter
-)
-
-func getUnitsString( units int ) (string, string) {
-    switch units {
-    case _DOTS_PER_ARBITRARY_UNIT: return "dots per abitrary unit", "dp?"
-    case _DOTS_PER_INCH:           return "dots per inch", "dpi"
-    case _DOTS_PER_CM:             return "dots per centimeter", "dpcm"
-    }
-    return "Unknown units", ""
-}
-
-func isTagSOFn( tag uint ) bool {
-    if tag < _SOF0 || tag > _SOF15 { return false }
-    if tag == _DHT || tag == _JPG || tag == _DAC { return false }
-    return true
-}
-
-const (
-    _APP0_JFIF = iota
-    _APP0_JFXX
-)
-
-func markerAPP0discriminator( h5 []byte ) int {
-    if bytes.Equal( h5, []byte( "JFIF\x00" ) ) { return _APP0_JFIF }
-    if bytes.Equal( h5, []byte( "JFXX\x00" ) ) { return _APP0_JFXX }
-    return -1
-}
-
-const (
-    _THUMBNAIL_BASELINE = 0x10
-    _THUMBNAIL_PALETTE  = 0x11
-    _THUMBNAIL_RGB      = 0x12
-)
-
-func (jpg *JpegDesc) app0( tag, sLen uint ) error {
-    if sLen < 8 {
-        return fmt.Errorf( "app0: Wrong APP0 (JFIF) header (invalid length %d)\n", sLen )
-    }
-    if jpg.state != _APPLICATION {
-        return fmt.Errorf( "app0: Wrong sequence %s in state %s\n",
-                           getJPEGTagName(_APP0), jpg.getJPEGStateName() )
-    }
-    offset := jpg.offset + 4    // points 1 byte after length
-    appType := markerAPP0discriminator( jpg.data[offset:offset+5] )
-    if appType == -1 {
-        return fmt.Errorf( "app0: Wrong APP0 header (%s)\n", jpg.data[offset:offset+4] )
-    }
-
-    if jpg.Content {
-        fmt.Printf( "APP0\n" )
-    }
-    var err error
-    if appType == _APP0_JFIF {
-        if sLen < 16 {
-            return fmt.Errorf( "app0: Wrong APP0 (JFIF) header (invalid length %d)\n", sLen )
-        }
-
-        HtNail := uint( jpg.data[offset+12] )
-        VtNail := uint( jpg.data[offset+13] )
-        if jpg.Content {
-            major := uint( jpg.data[offset+5] )  // 0x01
-            minor := uint( jpg.data[offset+6] )  // 0x02
-            fmt.Printf( "  JFIF Version %d.%02d\n", major, minor )
-
-            unitCode := int( jpg.data[offset+7] )
-            units, symb := getUnitsString( unitCode )
-            fmt.Printf( "  size in %s (%s)\n", units, symb )
-
-            Hdensity := uint( jpg.data[offset+8] ) << 8 + uint( jpg.data[offset+9] )
-            Vdensity := uint( jpg.data[offset+10] ) << 8 + uint( jpg.data[offset+11] )
-            fmt.Printf( "  density %d,%d %s\n", Hdensity, Vdensity, symb )
-            fmt.Printf( "  thumbnail %d,%d pixels\n", HtNail, VtNail )
-        }
-        if sLen != 16 + HtNail * VtNail {
-            return fmt.Errorf( "app0: Wrong APP0 (JFIF) header (len %d)\n", sLen )
-        }
-
-        err = jpg.addTable( tag, jpg.offset, jpg.offset + 2 + sLen, original )
-
-    } else {
-        if len(jpg.tables) != 1 {
-            return fmt.Errorf( "app0: APP0 extension does not follow APP0 (JFIF)\n" )
-        }
-        if jpg.app0Extension {
-            return fmt.Errorf( "app0: Multiple APP0 extensions\n" )
-        }
-        if jpg.Content {
-            fmt.Printf( "  JFIF extension\n" )
-            extCode := uint( jpg.data[offset+5] )
-            switch extCode {
-            default:
-                return fmt.Errorf( "app0: Wrong JFIF extention code (thumbnail) (code 0x%02d)\n", extCode )
-            case _THUMBNAIL_BASELINE:    // ignore for now
-                fmt.Printf( "  Thumbnail encoded according to ITU-T T.81 | ISO/IEC 10918-1 baseline process\n" )
-            case _THUMBNAIL_PALETTE:     // ignore for now
-                fmt.Printf( "  Thumbnail encoded as 1 byte per pixel in 256 entry RGB palette\n" )
-            case _THUMBNAIL_RGB:         // ignore for now
-                fmt.Printf( "  Thumbnail encoded as RGB (3 bytes per pixel)\n" )
-            }
-        }
-        jpg.app0Extension = true
-        err = jpg.addTable( tag, jpg.offset, jpg.offset + 2 + sLen, original )
-    }
-    if err != nil { return jpgForwardError( "app0", err ) }
     return nil
 }
 
@@ -577,7 +467,7 @@ func (jpg *JpegDesc) getMcuDesc( sComp *[]scanCompRef ) *mcuDesc {
     mcu.sComps = make( []scanComp, len(*sComp) )
 
     for i, sc := range( *sComp ) {
-        cmp := jpg.components[sc.CMId]
+        cmp := jpg.components[i]                        // ignore sc.CMId (order is fixed)
         mcu.sComps[i].hDC = jpg.hdefs[2*sc.DCId].root   // AC follows DC
         mcu.sComps[i].hAC = jpg.hdefs[2*sc.ACId+1].root // (2 tables per dest)
         nUnitsRow := ((jpg.resolution.nSamplesLine / jpg.resolution.mhSF) *
@@ -589,6 +479,7 @@ func (jpg *JpegDesc) getMcuDesc( sComp *[]scanCompRef ) *mcuDesc {
         mcu.sComps[i].nUnitsRow = nUnitsRow
         mcu.sComps[i].hSF = cmp.hSF
         mcu.sComps[i].vSF = cmp.vSF
+        fmt.Printf( "Component %d mcu def=%v\n", i, mcu.sComps[i] )
         // preallocate vSF * nUnitsLine for this component
         mcu.sComps[i].dUnits = make( [][64]int, cmp.vSF * nUnitsRow )
         // previousDC, dUCol, dURow, dUAnchor, nRows, count are set to 0
@@ -627,23 +518,23 @@ func getMcuFormat( sc *scan ) string {
     return string(mcuf[:j])
 }
 
-func (jpg *JpegDesc) startOfFrame( tag uint, sLen uint ) error {
+func (jpg *JpegDesc) startOfFrame( marker uint, sLen uint ) error {
     if jpg.Content {
-        fmt.Printf( "SOF%d\n", tag & 0x0f )
+        fmt.Printf( "SOF%d\n", marker & 0x0f )
     }
     if jpg.state != _FRAME {
         return fmt.Errorf( "startOfFrame: Wrong sequence %s in state %s\n",
-                           getJPEGTagName(tag), jpg.getJPEGStateName() )
+                           getJPEGmarkerName(marker), jpg.getJPEGStateName() )
     }
     if sLen < 8 {
-        return fmt.Errorf( "startOfFrame: Wrong SOF%d header (len %d)\n", tag & 0x0f, sLen )
+        return fmt.Errorf( "startOfFrame: Wrong SOF%d header (len %d)\n", marker & 0x0f, sLen )
     }
 
     offset := jpg.offset + 4
     nComponents := uint(jpg.data[offset+5])
     if sLen < 8 + (nComponents * 3) {
         return fmt.Errorf( "startOfFrame: Wrong SOF%d header (len %d for %d components)\n",
-                           tag & 0x0f, sLen, nComponents )
+                           marker & 0x0f, sLen, nComponents )
     }
     samplePrecision := uint(jpg.data[offset])
     nLines := uint(jpg.data[offset+1]) << 8 + uint(jpg.data[offset+2])
@@ -682,7 +573,7 @@ func (jpg *JpegDesc) startOfFrame( tag uint, sLen uint ) error {
     jpg.resolution.mhSF = maxHSF
     jpg.resolution.mvSF = maxVSF
 
-    err := jpg.addTable( tag, jpg.offset, jpg.offset + 2 + sLen, original )
+    err := jpg.addTable( marker, jpg.offset, jpg.offset + 2 + sLen, original )
     jpg.scans = append( jpg.scans, scan{ } )    // ready for the first scan (yet unknown)
     jpg.state = _SCAN1
     if err != nil { return jpgForwardError( "startOfFrame", err ) }
@@ -1653,13 +1544,13 @@ encodedLoop:
     return nMCUs, nil
 }
 
-func (jpg *JpegDesc) processScan( tag, sLen uint ) error {
+func (jpg *JpegDesc) processScan( marker, sLen uint ) error {
     if jpg.Content {
         fmt.Printf( "SOS\n" )
     }
     if (jpg.state != _SCAN1 && jpg.state != _SCANn) {
         return fmt.Errorf( "processScan: Wrong sequence %s in state %s\n",
-                            getJPEGTagName(tag), jpg.getJPEGStateName() )
+                            getJPEGmarkerName(marker), jpg.getJPEGStateName() )
     }
     if sLen < 6 {   // fixed size besides components
         return fmt.Errorf( "processScan: Wrong SOS header (len %d)\n", sLen )
@@ -1667,7 +1558,7 @@ func (jpg *JpegDesc) processScan( tag, sLen uint ) error {
 
     if err := jpg.processScanHeader( sLen ); err != nil { return err }
 
-    err := jpg.addTable( tag, jpg.offset, jpg.offset + 2 + sLen, original )
+    err := jpg.addTable( marker, jpg.offset, jpg.offset + 2 + sLen, original )
     if err != nil {
         return jpgForwardError( "processScan", err )
     }
@@ -1733,7 +1624,7 @@ func (jpg *JpegDesc) processScan( tag, sLen uint ) error {
     return nil
 }
 
-func (jpg *JpegDesc)defineRestartInterval( tag, sLen uint ) error {
+func (jpg *JpegDesc)defineRestartInterval( marker, sLen uint ) error {
     offset := jpg.offset + 4
     restartInterval := uint(jpg.data[offset]) << 8 + uint(jpg.data[offset+1])
     jpg.nMcuRST = restartInterval
@@ -1746,7 +1637,7 @@ func (jpg *JpegDesc)defineRestartInterval( tag, sLen uint ) error {
                         jpg.resolution.nSamplesLine )
         }
     }
-    return jpg.addTable( tag, jpg.offset, jpg.offset + 2 + sLen, original )
+    return jpg.addTable( marker, jpg.offset, jpg.offset + 2 + sLen, original )
 }
 
 var zigZagRowCol = [8][8]int{{  0,  1,  5,  6, 14, 15, 27, 28 },
@@ -1783,7 +1674,7 @@ func (jpg *JpegDesc)printQuantizationMatrix( pq, tq uint ) {
     }
 }
 
-func (jpg *JpegDesc)defineQuantizationTable( tag, sLen uint ) ( err error ) {
+func (jpg *JpegDesc)defineQuantizationTable( marker, sLen uint ) ( err error ) {
 
     end := jpg.offset + 2 + sLen
     offset := jpg.offset + 4
@@ -1830,7 +1721,7 @@ func (jpg *JpegDesc)defineQuantizationTable( tag, sLen uint ) ( err error ) {
         return fmt.Errorf( "defineQuantizationTable: Invalid DQT length: %d actual: %d\n",
                            sLen, offset - jpg.offset -2 )
     }
-    return jpg.addTable( tag, jpg.offset, end, original )
+    return jpg.addTable( marker, jpg.offset, end, original )
 }
 
 func buildTree( huffDef *hdef ) {
@@ -1926,7 +1817,7 @@ VALUE_LOOP:
     fmt.Printf("    Total number of symbols: %d\n", nSymbols )
 }
 
-func (jpg *JpegDesc)defineHuffmanTable( tag, sLen uint ) ( err error ) {
+func (jpg *JpegDesc)defineHuffmanTable( marker, sLen uint ) ( err error ) {
 
     end := jpg.offset + 2 + sLen
     offset := jpg.offset + 4
@@ -1990,10 +1881,10 @@ func (jpg *JpegDesc)defineHuffmanTable( tag, sLen uint ) ( err error ) {
     if offset != end {
         return fmt.Errorf( "defineHuffmanTable: Invalid DHT length: %d actual: %d\n", sLen, offset - jpg.offset -2 )
     }
-    return jpg.addTable( tag, jpg.offset, end, original )
+    return jpg.addTable( marker, jpg.offset, end, original )
 }
 
-func (jpg *JpegDesc)commentSegment( tag, sLen uint ) error {
+func (jpg *JpegDesc)commentSegment( marker, sLen uint ) error {
     if jpg.Content {
         offset := jpg.offset
         var b bytes.Buffer
@@ -2005,13 +1896,13 @@ func (jpg *JpegDesc)commentSegment( tag, sLen uint ) error {
     return nil
 }
 
-func (jpg *JpegDesc)defineNumberOfLines( tag, sLen uint ) ( err error ) {
+func (jpg *JpegDesc)defineNumberOfLines( marker, sLen uint ) ( err error ) {
     if jpg.Content {
         fmt.Printf( "DNL\n" )
     }
     if jpg.state != _SCANn {
         return fmt.Errorf( "defineNumberOfLines: Wrong sequence %s in state %s\n",
-                       getJPEGTagName(tag), jpg.getJPEGStateName() )
+                       getJPEGmarkerName(marker), jpg.getJPEGStateName() )
     }
     if sLen != 4 {   // fixed size
         return fmt.Errorf( "defineNumberOfLines: Wrong DNL header (len %d)\n", sLen )
@@ -2058,7 +1949,7 @@ func (jpg *JpegDesc)defineNumberOfLines( tag, sLen uint ) ( err error ) {
         }
 
         // otherwise just add the table
-        err = jpg.addTable( tag, jpg.offset, jpg.offset + 2 + sLen, original )
+        err = jpg.addTable( marker, jpg.offset, jpg.offset + 2 + sLen, original )
     }
     return
 }
@@ -2103,9 +1994,9 @@ func (jpg *JpegDesc)fixLines( ) {
                 prevLines, nLines)
 }
 
-func (jpg *JpegDesc)printMarker( tag, sLen, offset uint ) {
+func (jpg *JpegDesc)printMarker( marker, sLen, offset uint ) {
     if jpg.Markers {
-        fmt.Printf( "Tag 0x%x, len %d, offset 0x%x (%s)\n", tag, sLen, offset, getJPEGTagName(tag) )
+        fmt.Printf( "Marker 0x%x, len %d, offset 0x%x (%s)\n", marker, sLen, offset, getJPEGmarkerName(marker) )
     }
 }
 
@@ -2152,93 +2043,96 @@ func Analyze( data []byte, toDo *Control ) ( *JpegDesc, error ) {
     jpg.data = data
 
     if ! bytes.Equal( data[0:2],  []byte{ 0xff, 0xd8 } ) {
-		return jpg, fmt.Errorf( "Analyse: Wrong signature 0x%x for a JPEG file\n", data[0:2] )
+		return jpg, fmt.Errorf( "Analyze: Wrong signature 0x%x for a JPEG file\n", data[0:2] )
 	}
 
     tLen := uint(len(data))
     for i := uint(0); i < tLen; {
-        tag := uint(data[i]) << 8 + uint(data[i+1])
+        marker := uint(data[i]) << 8 + uint(data[i+1])
         sLen := uint(0)       // case of a segment without any data
 
-        if tag < _TEM {
-		    return jpg, fmt.Errorf( "Analyse: invalid marker 0x%x\n", data[i:i+1] )
+        if marker < _TEM {
+		    return jpg, fmt.Errorf( "Analyze: invalid marker 0x%x\n", data[i:i+1] )
         }
 
-        switch tag {
+        switch marker {
 
         case _SOI:            // no data, no length
-            jpg.printMarker( tag, sLen, i )
+            jpg.printMarker( marker, sLen, i )
             if jpg.state != _INIT {
-		        return jpg, fmt.Errorf( "Analyse: Wrong sequence %s in state %s\n",
-                                        getJPEGTagName(tag), jpg.getJPEGStateName() )
+		        return jpg, fmt.Errorf( "Analyze: Wrong sequence %s in state %s\n",
+                                        getJPEGmarkerName(marker), jpg.getJPEGStateName() )
             }
             jpg.state = _APPLICATION
 
         case _RST0, _RST1, _RST2, _RST3, _RST4, _RST5, _RST6, _RST7: // empty segment, no following length
-            jpg.printMarker( tag, sLen, i )
-            return jpg, fmt.Errorf ("Analyse: Marker %s hould not happen in top level segments\n",
-                                     getJPEGTagName(tag) )
+            jpg.printMarker( marker, sLen, i )
+            return jpg, fmt.Errorf ("Analyze: Marker %s hould not happen in top level segments\n",
+                                     getJPEGmarkerName(marker) )
 
         case _EOI:
-            jpg.printMarker( tag, sLen, i )
+            jpg.printMarker( marker, sLen, i )
             if jpg.state != _SCAN1 && jpg.state != _SCANn {
-		        return jpg, fmt.Errorf( "Analyse: Wrong sequence %s in state %s\n",
-                            getJPEGTagName(tag), jpg.getJPEGStateName() )
+		        return jpg, fmt.Errorf( "Analyze: Wrong sequence %s in state %s\n",
+                            getJPEGmarkerName(marker), jpg.getJPEGStateName() )
             }
             jpg.state = _FINAL
             jpg.offset = i + 2  // points after the last byte
             if jpg.Fix { jpg.fixLines( ) }
             break
 
-        default:        // all other cases have data following tag & length
+        default:        // all other cases have data following marker & length
             sLen = uint(data[i+2]) << 8 + uint(data[i+3])
-            jpg.printMarker( tag, sLen, i )
+            jpg.printMarker( marker, sLen, i )
             var err error
 
-            switch tag {    // second level tag switching within the first default
+            switch marker {    // second level marker switching within the first default
             case _APP0:
-                err = jpg.app0( tag, sLen )
+                err = jpg.app0( marker, sLen )
 
-            case _APP1, _APP2, _APP3, _APP4, _APP5, _APP6, _APP7, _APP8, _APP9,
+            case _APP1:
+                err = jpg.app1( marker, sLen )
+
+            case _APP2, _APP3, _APP4, _APP5, _APP6, _APP7, _APP8, _APP9,
                  _APP10, _APP11, _APP12, _APP13, _APP14, _APP15:
 
             case _SOF0, _SOF1, _SOF2, _SOF3, _SOF5, _SOF6, _SOF7, _SOF9, _SOF10,
                  _SOF11, _SOF13, _SOF14, _SOF15:
-                err = jpg.startOfFrame( tag, sLen )
+                err = jpg.startOfFrame( marker, sLen )
 
             case _DHT:  // Define Huffman Table
-                err = jpg.defineHuffmanTable( tag, sLen )
+                err = jpg.defineHuffmanTable( marker, sLen )
 
             case _DQT:  // Define Quantization Table
-                err = jpg.defineQuantizationTable( tag, sLen )
+                err = jpg.defineQuantizationTable( marker, sLen )
 
             case _DAC:    // Define Arithmetic coding
-                err = jpg.addTable( tag, jpg.offset, jpg.offset + 2 + sLen, original )
+                err = jpg.addTable( marker, jpg.offset, jpg.offset + 2 + sLen, original )
 
             case _DNL:
-                err = jpg.defineNumberOfLines( tag, sLen )
+                err = jpg.defineNumberOfLines( marker, sLen )
 
             case  _DRI:  // Define Restart Interval
-                err = jpg.defineRestartInterval( tag, sLen )
+                err = jpg.defineRestartInterval( marker, sLen )
 
             case _SOS:
-                err = jpg.processScan( tag, sLen )
-                if err != nil { return jpg, jpgForwardError( "Analyse", err ) }
+                err = jpg.processScan( marker, sLen )
+                if err != nil { return jpg, jpgForwardError( "Analyze", err ) }
                 i = jpg.offset          // jpg.offset has been updated
                 continue
 
             case _COM:  // Comment
-                err = jpg.commentSegment( tag, sLen )
+                err = jpg.commentSegment( marker, sLen )
 
             case _DHP, _EXP:  // Define Hierarchical Progression, Expand reference components
-                return jpg, fmt.Errorf( "Analyse: Unsupported hierarchical table %s\n",
-                                        getJPEGTagName(tag) )
+                return jpg, fmt.Errorf( "Analyze: Unsupported hierarchical table %s\n",
+                                        getJPEGmarkerName(marker) )
 
-            default:    // All JPEG extensions and reserved tags (_JPG, _TEM, _RESn)
-                return jpg, fmt.Errorf( "Analyse: Unsupported JPEG extension or reserved tag%s\n",
-                                        getJPEGTagName(tag) )
+            default:    // All JPEG extensions and reserved markers (_JPG, _TEM, _RESn)
+                return jpg, fmt.Errorf( "Analyze: Unsupported JPEG extension or reserved marker%s\n",
+                                        getJPEGmarkerName(marker) )
             }
-            if err != nil { return jpg, jpgForwardError( "Analyse", err ) }
+            if err != nil { return jpg, jpgForwardError( "Analyze", err ) }
             if jpg.state == _APPLICATION {
                 jpg.state = _FRAME
             }
