@@ -479,7 +479,6 @@ func (jpg *JpegDesc) getMcuDesc( sComp *[]scanCompRef ) *mcuDesc {
         mcu.sComps[i].nUnitsRow = nUnitsRow
         mcu.sComps[i].hSF = cmp.hSF
         mcu.sComps[i].vSF = cmp.vSF
-        fmt.Printf( "Component %d mcu def=%v\n", i, mcu.sComps[i] )
         // preallocate vSF * nUnitsLine for this component
         mcu.sComps[i].dUnits = make( [][64]int, cmp.vSF * nUnitsRow )
         // previousDC, dUCol, dURow, dUAnchor, nRows, count are set to 0
@@ -1248,7 +1247,7 @@ func (jpg *JpegDesc) processECS( nMCUs uint) (uint, error) {
     component can use (hSF *vSF). This is a small rectangular area whose
     top-left corner is located at dUAnchor in the dUnits array. Area units
     are located at:
-        dUnits[dUAnchor+(nUnitsRow * dUcol) + dUrow], for dUcol in [0, vSF-1]
+        dUnits[dUAnchor+(nUnitsRow * dURow) + dUCol], for dUcol in [0, vSF-1]
                                                       and dUrow in [0, hSF-1].
     Once the number of vSF * hSF data units have been processed for the same
     component, unitAnchor is incremented by hSF for the next area, dUrow and
@@ -1493,7 +1492,7 @@ encodedLoop:
 //                                fmt.Printf("!!! Switching to component %d\n", sCompIndex)
                                 sComp = &scan.mcuD.sComps[sCompIndex]
                                 if sComp.dUAnchor == sComp.nUnitsRow { // end of DU slice
-                                    if nMCUs % jpg.nMcuRST != 0 {
+                                    if jpg.nMcuRST != 0 && nMCUs % jpg.nMcuRST != 0 {
                                         fmt.Printf("Warning: end of slice @MCU %d is not synced with RST intervals (%d)\n",
                                                     nMCUs, jpg.nMcuRST )
                                     }
@@ -1518,8 +1517,8 @@ encodedLoop:
                         }
                         sComp.count = 0
                         dUnit = &sComp.dUnits[sComp.dUAnchor +
-                                              (sComp.nUnitsRow * sComp.dUCol) +
-                                              sComp.dURow]
+                                              (sComp.nUnitsRow * sComp.dURow) +
+                                              sComp.dUCol]
 //                        fmt.Printf("Ready for next data unit: component %d anchor %d row %d col %d\n",
 //                                    sCompIndex, sComp.dUAnchor, sComp.dURow, sComp.dUCol)
                         curHcnode = sComp.hDC   // new data unit starts with DC coefficient
