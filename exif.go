@@ -48,6 +48,15 @@ func (jpg *JpegDesc)getBytes( offset, count uint ) []byte {
     return vSlice
 }
 
+func (jpg *JpegDesc) getBytesFromIFD( lEndian bool,
+                                      fCount, fOffset, origin uint ) []byte {
+    if fCount <= 4 {
+        return jpg.getBytes( fOffset, fCount )
+    }
+    offset := jpg.getUnsignedLong( lEndian, fOffset )
+    return jpg.getBytes( offset + origin, fCount )
+}
+
 func (jpg *JpegDesc)getASCIIString( offset, count uint ) string {
     var b strings.Builder
     b.Write( jpg.data[offset:offset+count] )
@@ -321,9 +330,18 @@ func (jpg *JpegDesc) checkTiffUnsignedRationals( name string, lEndian bool,
     return nil
 }
 
+
 const (
-//    _NewSubfileType             = 0xfe
-//    _SubfileType                = 0xff
+    _PRIMARY    = 0     // namespace for IFD0, first IFD
+    _THUMBNAIL  = 1     // namespace for IFD1 pointed to by IFD0
+    _EXIF       = 2     // exif namespace, pointed to by IFD0
+    _GPS        = 3     // gps namespace, pointed to by IFD0
+    _IOP        = 4     // Interoperability namespace, pointed to by Exif IFD
+)
+
+const (                                     // _PRIMARY & _THUMBNAIL IFD tags
+//    _NewSubfileType             = 0xfe    // unused in Exif files
+//    _SubfileType                = 0xff    // unused in Exif files
     _ImageWidth                 = 0x100
     _ImageLength                = 0x101
     _BitsPerSample              = 0x102
@@ -413,78 +431,7 @@ const (
     _ExifIFD                    = 0x8769
 
     _GpsIFD                     = 0x8825
-
-    // Exif IFD specific tags
-    _ExposureTime               = 0x829a
-
-    _FNumber                    = 0x829d
-
-    _ExposureProgram            = 0x8822
-
-    _ISOSpeedRatings            = 0x8827
-
-    _ExifVersion                = 0x9000
-
-    _DateTimeOriginal           = 0x9003
-    _DateTimeDigitized          = 0x9004
-    _ComponentsConfiguration    = 0x9101
-
-    _ShutterSpeedValue          = 0x9201
-    _ApertureValue              = 0x9202
-    _BrightnessValue            = 0x9203
-    _ExposureBiasValue          = 0x9204
-
-    _MeteringMode               = 0x9207
-
-    _Flash                      = 0x9209
-    _FocalLength                = 0x920a
-
-    _SubjectArea                = 0x9214
-
-    _MakerNote                  = 0x927c
-
-    _SubsecTimeOriginal         = 0x9291
-    _SubsecTimeDigitized        = 0x9292
-
-    _FlashpixVersion            = 0xa000
-    _ColorSpace                 = 0xa001
-    _PixelXDimension            = 0xa002
-    _PixelYDimension            = 0xa003
-
-    _Interoperability           = 0x0a05
-
-    _SubjectLocation            = 0xa214
-    _SensingMethod              = 0xa217
-
-    _SceneType                  = 0xa301
-
-    _ExposureMode               = 0xa402
-    _WhiteBalance               = 0xa403
-    _DigitalZoomRatio           = 0xa404
-    _FocalLengthIn35mmFilm      = 0xa405
-    _SceneCaptureType           = 0xa406
-
-    _LensSpecification          = 0xa432
-    _LensMake                   = 0xa433
-    _LensModel                  = 0xa434
 )
-
-const (
-    _PRIMARY    = 0     // namespace for IFD0, first IFD
-    _THUMBNAIL  = 1     // namespace for IFD1 pointed to by IFD0
-    _EXIF       = 2     // exif namespace, pointed to by IFD0
-    _GPS        = 3     // gps namespace, pointed to by IFD0
-)
-
-func (jpg *JpegDesc) checkTiffPrimaryThumbnailAscii( name string,
-                                                     ifd, fType, fCount, fOffset, origin uint,
-                                                     lEndian bool ) error {
-    if ifd != _PRIMARY && ifd != _THUMBNAIL {
-        return fmt.Errorf( "%s: tag used outside Primary or thumbnail IFD\n", name )
-    }
-
-     return jpg.checkTiffAscii( name, lEndian, fType, fCount, fOffset, origin )
-}
 
 func (jpg *JpegDesc) checkTiffCompression( ifd, fType, fCount, fOffset, origin uint,
                                            lEndian bool ) error {
@@ -493,9 +440,6 @@ func (jpg *JpegDesc) checkTiffCompression( ifd, fType, fCount, fOffset, origin u
 When a primary image is JPEG compressed, this designation is not necessary and is omitted.
 When thumbnails use JPEG compression, this tag value is set to 6.
 */
-    if ifd != _PRIMARY && ifd != _THUMBNAIL {
-        return fmt.Errorf( "Compression: tag used outside Primary or thumbnail IFD\n" )
-    }
     fmtCompression := func( v uint ) {
         var cString string
         switch( v ) {
@@ -529,9 +473,6 @@ When thumbnails use JPEG compression, this tag value is set to 6.
 
 func (jpg *JpegDesc) checkTiffOrientation( ifd, fType, fCount, fOffset, origin uint,
                                            lEndian bool ) error {
-    if ifd != _PRIMARY && ifd != _THUMBNAIL {
-        return fmt.Errorf( "Orientation: tag used outside Primary or thumbnail IFD\n" )
-    }
     fmtOrientation := func( v uint ) {
         var oString string
         switch( v ) {
@@ -553,21 +494,8 @@ func (jpg *JpegDesc) checkTiffOrientation( ifd, fType, fCount, fOffset, origin u
                                         fOffset, origin, fmtOrientation )
 }
 
-func (jpg *JpegDesc) checkTiffResolution( name string,
-                                          ifd, fType, fCount, fOffset, origin uint,
-                                          lEndian bool ) error {
-    if ifd != _PRIMARY && ifd != _THUMBNAIL {
-        return fmt.Errorf( "%s: tag used outside Primary or thumbnail IFD\n", name )
-    }
-    return jpg.checkTiffUnsignedRational( "YResolution", lEndian, fType, fCount,
-                                          fOffset, origin, nil )
-}
-
 func (jpg *JpegDesc) checkTiffResolutionUnit( ifd, fType, fCount, fOffset, origin uint,
                                               lEndian bool ) error {
-    if ifd != _PRIMARY && ifd != _THUMBNAIL {
-        return fmt.Errorf( "ResolutionUnit: tag used outside Primary or thumbnail IFD\n" )
-    }
     fmtResolutionUnit := func( v uint ) {
         var ruString string
         switch( v ) {
@@ -586,9 +514,6 @@ func (jpg *JpegDesc) checkTiffResolutionUnit( ifd, fType, fCount, fOffset, origi
 
 func (jpg *JpegDesc) checkTiffYCbCrPositioning( ifd, fType, fCount, fOffset, origin uint,
                                               lEndian bool ) error {
-    if ifd != _PRIMARY && ifd != _THUMBNAIL {
-        return fmt.Errorf( "YCbCrPositioning: tag used outside Primary or thumbnail IFD\n" )
-    }
     fmtYCbCrPositioning := func( v uint ) {
         var posString string
         switch( v ) {
@@ -604,11 +529,110 @@ func (jpg *JpegDesc) checkTiffYCbCrPositioning( ifd, fType, fCount, fOffset, ori
                                        fOffset, origin, fmtYCbCrPositioning )
 }
 
-func (jpg *JpegDesc) checkExifVersion( ifd, fType, fCount, fOffset, origin uint,
-                                       lEndian bool ) error {
-    if ifd != _EXIF {
-        return fmt.Errorf( "ExifVersion: tag used outside EXIF IFD\n" )
+func (jpg *JpegDesc) checkTiffTag( ifd, tag, fType, fCount, fOffset, origin uint,
+                                   lEndian bool ) error {
+    switch tag {
+    case _Compression:
+        return jpg.checkTiffCompression( ifd, fType, fCount, fOffset, origin, lEndian )
+    case _Make:
+        return jpg.checkTiffAscii( "Make", lEndian, fType, fCount, fOffset, origin )
+    case _Model:
+        return jpg.checkTiffAscii( "Model", lEndian, fType, fCount, fOffset, origin )
+    case _Orientation:
+        return jpg.checkTiffOrientation( ifd, fType, fCount, fOffset, origin, lEndian )
+    case _XResolution:
+        return jpg.checkTiffUnsignedRational( "XResolution", lEndian, fType, fCount,
+                                              fOffset, origin, nil )
+    case _YResolution:
+        return jpg.checkTiffUnsignedRational( "YResolution", lEndian, fType, fCount,
+                                              fOffset, origin, nil )
+    case _ResolutionUnit:
+        return jpg.checkTiffResolutionUnit( ifd, fType, fCount, fOffset, origin, lEndian )
+    case _Software:
+        return jpg.checkTiffAscii( "Software", lEndian, fType, fCount, fOffset, origin )
+    case _DateTime:
+        return jpg.checkTiffAscii( "Date", lEndian, fType, fCount, fOffset, origin )
+    case _YCbCrPositioning:
+        return jpg.checkTiffYCbCrPositioning( ifd, fType, fCount, fOffset, origin, lEndian )
+    case _Copyright:
+        return jpg.checkTiffAscii( "Copyright", lEndian, fType, fCount, fOffset, origin )
     }
+    return fmt.Errorf( "checkTiffTag: unknown or unsupported tag (%#02x) @offset %#04x count %d\n",
+                       tag, fOffset, fCount )
+}
+
+const (                                     // _EXIF IFD specific tags
+    _ExposureTime               = 0x829a
+
+    _FNumber                    = 0x829d
+
+    _ExposureProgram            = 0x8822
+
+    _ISOSpeedRatings            = 0x8827
+
+    _ExifVersion                = 0x9000
+
+    _DateTimeOriginal           = 0x9003
+    _DateTimeDigitized          = 0x9004
+
+    _ComponentsConfiguration    = 0x9101
+    _CompressedBitsPerPixel     = 0x9102
+
+    _ShutterSpeedValue          = 0x9201
+    _ApertureValue              = 0x9202
+    _BrightnessValue            = 0x9203
+    _ExposureBiasValue          = 0x9204
+    _MaxApertureValue           = 0x9205
+
+    _MeteringMode               = 0x9207
+    _LightSource                = 0x9208
+    _Flash                      = 0x9209
+    _FocalLength                = 0x920a
+
+    _SubjectArea                = 0x9214
+
+    _MakerNote                  = 0x927c
+
+    _UserComment                = 0x9286
+
+    _SubsecTime                 = 0x9290
+    _SubsecTimeOriginal         = 0x9291
+    _SubsecTimeDigitized        = 0x9292
+
+    _FlashpixVersion            = 0xa000
+    _ColorSpace                 = 0xa001
+    _PixelXDimension            = 0xa002
+    _PixelYDimension            = 0xa003
+
+    _InteroperabilityIFD        = 0xa005
+
+    _SubjectLocation            = 0xa214
+    _SensingMethod              = 0xa217
+
+    _FileSource                 = 0xa300
+    _SceneType                  = 0xa301
+    _CFAPattern                 = 0xa302
+
+    _CustomRendered             = 0xa401
+    _ExposureMode               = 0xa402
+    _WhiteBalance               = 0xa403
+    _DigitalZoomRatio           = 0xa404
+    _FocalLengthIn35mmFilm      = 0xa405
+    _SceneCaptureType           = 0xa406
+    _GainControl                = 0xa407
+    _Contrast                   = 0xa408
+    _Saturation                 = 0xa409
+    _Sharpness                  = 0xa40a
+
+    _SubjectDistanceRange       = 0xa40c
+
+    _LensSpecification          = 0xa432
+    _LensMake                   = 0xa433
+    _LensModel                  = 0xa434
+)
+
+func (jpg *JpegDesc) checkExifVersion( fType, fCount, fOffset, origin uint,
+                                       lEndian bool ) error {
   // special case: tiff type is undefined, but it is actually ASCII
     if fType != _Undefined {
         return fmt.Errorf( "ExifVersion: invalid byte type (%s)\n", getTiffTString( fType ) )
@@ -616,19 +640,8 @@ func (jpg *JpegDesc) checkExifVersion( ifd, fType, fCount, fOffset, origin uint,
     return jpg.checkTiffAscii( "ExifVersion", lEndian, _ASCIIString, fCount, fOffset, origin )
 }
 
-func (jpg *JpegDesc) checkExifAscii( name string, ifd, fType, fCount, fOffset, origin uint,
-                                     lEndian bool ) error {
-    if ifd != _EXIF {
-        return fmt.Errorf( "%d: tag used outside EXIF IFD\n", name )
-    }
-    return jpg.checkTiffAscii( name, lEndian, fType, fCount, fOffset, origin )
-}
-
-func (jpg *JpegDesc) checkExifExposureTime( ifd, fType, fCount, fOffset, origin uint,
+func (jpg *JpegDesc) checkExifExposureTime( fType, fCount, fOffset, origin uint,
                                             lEndian bool ) error {
-    if ifd != _EXIF {
-        return fmt.Errorf( "ExposureTime: tag used outside EXIF IFD\n" )
-    }
     fmtExposureTime := func( v rational ) {
         fmt.Printf( "%f seconds\n", float32(v.numerator)/float32(v.denominator) )
     }
@@ -636,20 +649,8 @@ func (jpg *JpegDesc) checkExifExposureTime( ifd, fType, fCount, fOffset, origin 
                                           fOffset, origin, fmtExposureTime )
 }
 
-func (jpg *JpegDesc) checkExifFNumber( ifd, fType, fCount, fOffset, origin uint,
-                                       lEndian bool ) error {
-    if ifd != _EXIF {
-        return fmt.Errorf( "ExposureTime: tag used outside EXIF IFD\n" )
-    }
-    return jpg.checkTiffUnsignedRational( "FNumber", lEndian, fType, fCount,
-                                          fOffset, origin, nil )
-}
-
-func (jpg *JpegDesc) checkExifExposureProgram( ifd, fType, fCount, fOffset, origin uint,
+func (jpg *JpegDesc) checkExifExposureProgram( fType, fCount, fOffset, origin uint,
                                                lEndian bool ) error {
-    if ifd != _EXIF {
-        return fmt.Errorf( "ExposureProgram: tag used outside EXIF IFD\n" )
-    }
     fmtExposureProgram := func( v uint ) {
         var epString string
         switch v {
@@ -672,21 +673,9 @@ func (jpg *JpegDesc) checkExifExposureProgram( ifd, fType, fCount, fOffset, orig
                                         fOffset, origin, fmtExposureProgram )
 }
 
-func (jpg *JpegDesc) checkExifISOSpeedRatings( ifd, fType, fCount, fOffset, origin uint,
-                                               lEndian bool ) error {
-    if ifd != _EXIF {
-        return fmt.Errorf( "ISOSpeedRatings: tag used outside EXIF IFD\n" )
-    }
-    return jpg.checkTiffUnsignedShorts( "ISOSpeedRatings", lEndian, fType, fCount,
-                                        fOffset, origin )
-}
-
-func (jpg *JpegDesc) checkExifComponentsConfiguration( ifd, fType, fCount, fOffset, origin uint,
+func (jpg *JpegDesc) checkExifComponentsConfiguration( fType, fCount, fOffset, origin uint,
                                                        lEndian bool ) error {
-    if ifd != _EXIF {
-        return fmt.Errorf( "ComponentsConfiguration: tag used outside EXIF IFD\n" )
-    }
-    if fType != _Undefined {
+    if fType != _Undefined {  // special case: tiff type is undefined, but it is actually bytes
         return fmt.Errorf( "ComponentsConfiguration: invalid type (%s)\n", getTiffTString( fType ) )
     }
     if fCount != 4 {
@@ -710,47 +699,8 @@ func (jpg *JpegDesc) checkExifComponentsConfiguration( ifd, fType, fCount, fOffs
     return nil
 }
 
-func (jpg *JpegDesc) checkExifShutterSpeedValue( ifd, fType, fCount, fOffset, origin uint,
-                                                 lEndian bool ) error {
-    if ifd != _EXIF {
-        return fmt.Errorf( "ShutterSpeedValue: tag used outside EXIF IFD\n" )
-    }
-    return jpg.checkTiffSignedRational( "ShutterSpeedValue", lEndian, fType, fCount,
-                                         fOffset, origin, nil )
-}
-
-func (jpg *JpegDesc) checkExifApertureValue( ifd, fType, fCount, fOffset, origin uint,
-                                             lEndian bool ) error {
-    if ifd != _EXIF {
-        return fmt.Errorf( "ApertureValue: tag used outside EXIF IFD\n" )
-    }
-    return jpg.checkTiffUnsignedRational( "ApertureValue", lEndian, fType, fCount,
-                                           fOffset, origin, nil )
-}
-
-func (jpg *JpegDesc) checkExifBrightnessValue( ifd, fType, fCount, fOffset, origin uint,
-                                               lEndian bool ) error {
-    if ifd != _EXIF {
-        return fmt.Errorf( "BrightnessValue: tag used outside EXIF IFD\n" )
-    }
-    return jpg.checkTiffSignedRational( "BrightnessValue", lEndian, fType, fCount,
-                                        fOffset, origin, nil )
-}
-
-func (jpg *JpegDesc) checkExifExposureBiasValue( ifd, fType, fCount, fOffset, origin uint,
-                                                 lEndian bool ) error {
-    if ifd != _EXIF {
-        return fmt.Errorf( "ExposureBiasValue: tag used outside EXIF IFD\n" )
-    }
-    return jpg.checkTiffSignedRational( "ExposureBiasValue", lEndian, fType, fCount,
-                                        fOffset, origin, nil )
-}
-
-func (jpg *JpegDesc) checkExifMeteringMode( ifd, fType, fCount, fOffset, origin uint,
+func (jpg *JpegDesc) checkExifMeteringMode( fType, fCount, fOffset, origin uint,
                                             lEndian bool ) error {
-    if ifd != _EXIF {
-        return fmt.Errorf( "MeteringMode: tag used outside EXIF IFD\n" )
-    }
     fmtMeteringMode := func( v uint ) {
         var mmString string
         switch v {
@@ -772,11 +722,44 @@ func (jpg *JpegDesc) checkExifMeteringMode( ifd, fType, fCount, fOffset, origin 
                                         fOffset, origin, fmtMeteringMode )
 }
 
-func (jpg *JpegDesc) checkExifFlash( ifd, fType, fCount, fOffset, origin uint,
-                                     lEndian bool ) error {
-    if ifd != _EXIF {
-        return fmt.Errorf( "Flash: tag used outside EXIF IFD\n" )
+func (jpg *JpegDesc) checkExifLightSource( fType, fCount, fOffset, origin uint,
+                                           lEndian bool ) error {
+    fmtLightSource := func( v uint ) {
+        var lsString string
+        switch v {
+        case 0 : lsString = "Unknown"
+        case 1 : lsString = "Daylight"
+        case 2 : lsString = "Fluorescent"
+        case 3 : lsString = "Tungsten (incandescent light)"
+        case 4 : lsString = "Flash"
+        case 9 : lsString = "Fine weather"
+        case 10 : lsString = "Cloudy weather"
+        case 11 : lsString = "Shade"
+        case 12 : lsString = "Daylight fluorescent (D 5700 - 7100K)"
+        case 13 : lsString = "Day white fluorescent (N 4600 - 5400K)"
+        case 14 : lsString = "Cool white fluorescent (W 3900 - 4500K)"
+        case 15 : lsString = "White fluorescent (WW 3200 - 3700K)"
+        case 17 : lsString = "Standard light A"
+        case 18 : lsString = "Standard light B"
+        case 19 : lsString = "Standard light C"
+        case 20 : lsString = "D55"
+        case 21 : lsString = "D65"
+        case 22 : lsString = "D75"
+        case 23 : lsString = "D50"
+        case 24 : lsString = "ISO studio tungsten"
+        case 255: lsString = "Other light source"
+        default:
+            fmt.Printf( "Illegal light source (%d)\n", v )
+            return
+        }
+        fmt.Printf( "%s\n", lsString )
     }
+    return jpg.checkTiffUnsignedShort( "LightSource", lEndian, fType, fCount,
+                                        fOffset, origin, fmtLightSource )
+}
+
+func (jpg *JpegDesc) checkExifFlash( fType, fCount, fOffset, origin uint,
+                                     lEndian bool ) error {
     fmtFlash := func( v uint ) {
         var fString string
         switch v {
@@ -811,20 +794,8 @@ func (jpg *JpegDesc) checkExifFlash( ifd, fType, fCount, fOffset, origin uint,
                                         fOffset, origin, fmtFlash )
 }
 
-func (jpg *JpegDesc) checkExifFocalLength( ifd, fType, fCount, fOffset, origin uint,
+func (jpg *JpegDesc) checkExifSubjectArea( fType, fCount, fOffset, origin uint,
                                            lEndian bool ) error {
-    if ifd != _EXIF {
-        return fmt.Errorf( "FocalLength: tag used outside EXIF IFD\n" )
-    }
-    return jpg.checkTiffUnsignedRational( "FocalLength", lEndian, fType, fCount,
-                                           fOffset, origin, nil )
-}
-
-func (jpg *JpegDesc) checkExifSubjectArea( ifd, fType, fCount, fOffset, origin uint,
-                                           lEndian bool ) error {
-    if ifd != _EXIF {
-        return fmt.Errorf( "SubjectArea: tag used outside EXIF IFD\n" )
-    }
     if fCount < 2 && fCount > 4 {
         return fmt.Errorf( "ComponentsConfiguration: invalid count (%d)\n", fCount )
     }
@@ -869,11 +840,8 @@ func dumpData( header string, data []byte ) {
     }
 }
 
-func (jpg *JpegDesc) checkExifMakerNote( ifd, fType, fCount, fOffset, origin uint,
+func (jpg *JpegDesc) checkExifMakerNote( fType, fCount, fOffset, origin uint,
                                          lEndian bool ) error {
-    if ifd != _EXIF {
-        return fmt.Errorf( "MakerNote: tag used outside EXIF IFD\n" )
-    }
     if fType != _Undefined {
         return fmt.Errorf( "MakerNote: invalid type (%s)\n", getTiffTString( fType ) )
     }
@@ -886,11 +854,49 @@ func (jpg *JpegDesc) checkExifMakerNote( ifd, fType, fCount, fOffset, origin uin
     return nil
 }
 
-func (jpg *JpegDesc) checkFlashpixVersion( ifd, fType, fCount, fOffset, origin uint,
+
+func (jpg *JpegDesc) checkExifUserComment( fType, fCount, fOffset, origin uint,
                                            lEndian bool ) error {
-    if ifd != _EXIF {
-        return fmt.Errorf( "FlashpixVersion: tag used outside EXIF IFD\n" )
+    if fType != _Undefined {
+        return fmt.Errorf( "UserComment: invalid type (%s)\n", getTiffTString( fType ) )
     }
+    if fCount < 8 {
+        return fmt.Errorf( "UserComment: invalid count (%s)\n", fCount )
+    }
+    //  first 8 Bytes are the encoding
+    offset := jpg.getUnsignedLong( lEndian, fOffset ) + origin
+    encoding := jpg.getBytes( offset, 8 )
+    switch encoding[0] {
+    case 0x41:  // ASCII?
+        if bytes.Equal( encoding, []byte{ 'A', 'S', 'C', 'I', 'I', 0, 0, 0 } ) {
+            fmt.Printf( "    UserComment: ITU-T T.50 IA5 (ASCII) [%s]\n", 
+                        string(jpg.getBytes( offset+8, fCount-8 )) )
+            return nil
+        }
+    case 0x4a: // JIS?
+        if bytes.Equal( encoding, []byte{ 'J', 'I', 'S', 0, 0, 0, 0, 0 } ) {
+            fmt.Printf( "    UserComment: JIS X208-1990 (JIS):" )
+            dumpData( "UserComment", jpg.data[offset+8:offset+fCount] )
+            return nil
+        }
+    case 0x55:  // UNICODE?
+        if bytes.Equal( encoding, []byte{ 'U', 'N', 'I', 'C', 'O', 'D', 'E', 0 } ) {
+            fmt.Printf( "    UserComment: Unicode Standard:" )
+            dumpData( "UserComment", jpg.data[offset+8:offset+fCount] )
+            return nil
+        }
+    case 0x00:  // Undefined
+        if bytes.Equal( encoding, []byte{ 0, 0, 0, 0, 0, 0, 0, 0 } ) {
+            fmt.Printf( "    UserComment: Undefined encoding:" )
+            dumpData( "UserComment", jpg.data[offset+8:offset+fCount] )
+            return nil
+        }
+    }
+    return fmt.Errorf( "UserComment: invalid encoding\n" )
+}
+
+func (jpg *JpegDesc) checkFlashpixVersion( fType, fCount, fOffset, origin uint,
+                                           lEndian bool ) error {
     if fType == _Undefined && fCount == 4 {
         return jpg.checkTiffAscii( "FlashpixVersion", lEndian, _ASCIIString, fCount, fOffset, origin )
     } else if fType != _Undefined {
@@ -899,11 +905,8 @@ func (jpg *JpegDesc) checkFlashpixVersion( ifd, fType, fCount, fOffset, origin u
     return fmt.Errorf( "FlashpixVersion: incorrect count (%d)\n", fCount )
 }
 
-func (jpg *JpegDesc) checkExifColorSpace( ifd, fType, fCount, fOffset, origin uint,
+func (jpg *JpegDesc) checkExifColorSpace( fType, fCount, fOffset, origin uint,
                                           lEndian bool ) error {
-    if ifd != _EXIF {
-        return fmt.Errorf( "ColorSpace: tag used outside EXIF IFD\n" )
-    }
     fmtColorSpace := func( v uint ) {
         var csString string
         switch v {
@@ -920,11 +923,8 @@ func (jpg *JpegDesc) checkExifColorSpace( ifd, fType, fCount, fOffset, origin ui
 }
 
 func (jpg *JpegDesc) checkExifDimension( name string,
-                                         ifd, fType, fCount, fOffset, origin uint,
+                                         fType, fCount, fOffset, origin uint,
                                          lEndian bool ) error {
-    if ifd != _EXIF {
-        return fmt.Errorf( "%s: tag used outside EXIF IFD\n", name )
-    }
     if fType == _UnsignedShort {
         return jpg.checkTiffUnsignedShort( name, lEndian, fType, fCount, fOffset, origin, nil )
     } else if fType == _UnsignedLong {
@@ -933,11 +933,8 @@ func (jpg *JpegDesc) checkExifDimension( name string,
     return fmt.Errorf( "%s: invalid type (%s)\n", name, getTiffTString( fType ) )
 }
 
-func (jpg *JpegDesc) checkExifSensingMethod( ifd, fType, fCount, fOffset, origin uint,
+func (jpg *JpegDesc) checkExifSensingMethod( fType, fCount, fOffset, origin uint,
                                              lEndian bool ) error {
-    if ifd != _EXIF {
-        return fmt.Errorf( "SensingMethod: tag used outside EXIF IFD\n" )
-    }
     fmtSensingMethod := func( v uint ) {
         var smString string
         switch v {
@@ -958,16 +955,29 @@ func (jpg *JpegDesc) checkExifSensingMethod( ifd, fType, fCount, fOffset, origin
                                         fOffset, origin, fmtSensingMethod )
 }
 
-func (jpg *JpegDesc) checkExifSceneType( ifd, fType, fCount, fOffset, origin uint,
-                                         lEndian bool ) error {
-    if ifd != _EXIF {
-        return fmt.Errorf( "SceneType: tag used outside EXIF IFD\n" )
+
+func (jpg *JpegDesc) checkExifFileSource( fType, fCount, fOffset, origin uint,
+                                          lEndian bool ) error {
+    if fType != _Undefined {
+        return fmt.Errorf( "FileSource: invalid type (%s)\n", getTiffTString( fType ) )
     }
+    fmtFileSource := func( v byte ) {       // expect byte
+        if v != 3 {
+            fmt.Printf( "Illegal file source (%d)\n", v )
+            return
+        }
+        fmt.Printf( "Digital Still Camera (DSC)\n" )
+    }
+    return jpg.checkTiffByte( "FileSource", lEndian, _UnsignedByte, fCount,
+                              fOffset, origin, fmtFileSource )
+}
+
+func (jpg *JpegDesc) checkExifSceneType( fType, fCount, fOffset, origin uint,
+                                         lEndian bool ) error {
     if fType != _Undefined {
         return fmt.Errorf( "SceneType: invalid type (%s)\n", getTiffTString( fType ) )
     }
-    // expect byte
-    fmtScheneType := func( v byte ) {
+    fmtScheneType := func( v byte ) {       // expect byte
         var stString string
         switch v {
         case 1 : stString = "Directly photographed"
@@ -981,11 +991,63 @@ func (jpg *JpegDesc) checkExifSceneType( ifd, fType, fCount, fOffset, origin uin
                               fOffset, origin, fmtScheneType )
 }
 
-func(jpg *JpegDesc) checkExifExposureMode( ifd, fType, fCount, fOffset, origin uint,
-                                           lEndian bool ) error {
-    if ifd != _EXIF {
-        return fmt.Errorf( "ExposureMode: tag used outside EXIF IFD\n" )
+func (jpg *JpegDesc) checkExifCFAPattern( fType, fCount, fOffset, origin uint,
+                                          lEndian bool ) error {
+    if fType != _Undefined {
+        return fmt.Errorf( "CFAPattern: invalid type (%s)\n", getTiffTString( fType ) )
     }
+    // structure describing the color filter array (CFA)
+    // 2 short words: horizontal repeat pixel unit (h), vertical repeat pixel unit (v)
+    // followed by h*v bytes, each byte value indicating a color:
+    // 0 RED, 1 GREEN, 2 BLUE, 3 CYAN, 4 MAGENTA, 5 YELLOW, 6 WHITE
+    // Since the structure cannot fit in 4 bytes, its location is inficated by an offset
+    offset := jpg.getUnsignedLong( lEndian, fOffset ) + origin
+    h := jpg.getUnsignedShort( lEndian, offset )
+    v := jpg.getUnsignedShort( lEndian, offset + 2 )
+    offset += 4
+    c := jpg.getBytes( offset, h * v )
+    fmt.Printf( "    CFAPattern:" )
+    for i := uint(0); i < v; i++ {
+        fmt.Printf("\n      Row %d:", i )
+        for j := uint(0); j < h; j++ {
+            var s string
+            switch c[(i*h)+j] {
+            case 0: s = "RED"
+            case 1: s = "GREEN"
+            case 2: s = "BLUE"
+            case 3: s = "CYAN"
+            case 4: s = "MAGENTA"
+            case 5: s = "YELLOW"
+            case 6: s = "WHITE"
+            default:
+                return fmt.Errorf( "\nCFAPattern: invalid color (%d)\n", c[(i*h)+j] )
+            }
+            fmt.Printf( " %s", s )
+        }
+    }
+    fmt.Printf( "\n" )
+    return nil
+}
+
+func(jpg *JpegDesc) checkExifCustomRendered( fType, fCount, fOffset, origin uint,
+                                             lEndian bool ) error {
+    fmtCustomRendered := func( v uint ) {
+        var crString string
+        switch v {
+        case 0 : crString = "Normal process"
+        case 1 : crString = "Custom process"
+        default:
+            fmt.Printf( "Illegal rendering process (%d)\n", v )
+            return
+        }
+        fmt.Printf( "%s\n", crString )
+    }
+    return jpg.checkTiffUnsignedShort( "CustomRendered", lEndian, fType, fCount,
+                                       fOffset, origin, fmtCustomRendered )
+}
+
+func(jpg *JpegDesc) checkExifExposureMode( fType, fCount, fOffset, origin uint,
+                                           lEndian bool ) error {
     fmtExposureMode := func( v uint ) {
         var emString string
         switch v {
@@ -1002,11 +1064,8 @@ func(jpg *JpegDesc) checkExifExposureMode( ifd, fType, fCount, fOffset, origin u
                                        fOffset, origin, fmtExposureMode )
 }
 
-func (jpg *JpegDesc) checkExifWhiteBalance( ifd, fType, fCount, fOffset, origin uint,
+func (jpg *JpegDesc) checkExifWhiteBalance( fType, fCount, fOffset, origin uint,
                                             lEndian bool ) error {
-    if ifd != _EXIF {
-        return fmt.Errorf( "WhiteBalance: tag used outside EXIF IFD\n" )
-    }
     fmtWhiteBalance := func( v uint ) {
         var wbString string
         switch v {
@@ -1022,11 +1081,8 @@ func (jpg *JpegDesc) checkExifWhiteBalance( ifd, fType, fCount, fOffset, origin 
                                        fOffset, origin, fmtWhiteBalance )
 }
 
-func (jpg *JpegDesc) checkExifDigitalZoomRatio( ifd, fType, fCount, fOffset, origin uint,
+func (jpg *JpegDesc) checkExifDigitalZoomRatio( fType, fCount, fOffset, origin uint,
                                                 lEndian bool ) error {
-    if ifd != _EXIF {
-        return fmt.Errorf( "DigitalZoomRatio: tag used outside EXIF IFD\n" )
-    }
     fmDigitalZoomRatio := func( v rational ) {
         if v.numerator == 0 {
             fmt.Printf( "not used\n" )
@@ -1040,20 +1096,8 @@ func (jpg *JpegDesc) checkExifDigitalZoomRatio( ifd, fType, fCount, fOffset, ori
                                          fOffset, origin, fmDigitalZoomRatio )
 }
 
-func (jpg *JpegDesc) checkExifFocalLengthIn35mmFilm( ifd, fType, fCount, fOffset, origin uint,
-                                                     lEndian bool ) error {
-    if ifd != _EXIF {
-        return fmt.Errorf( "FocalLengthIn35mmFilm: tag used outside EXIF IFD\n" )
-    }
-    return jpg.checkTiffUnsignedShort( "FocalLengthIn35mmFilm", lEndian, fType, fCount,
-                                       fOffset, origin, nil )
-}
-
-func (jpg *JpegDesc) checkExifSceneCaptureType( ifd, fType, fCount, fOffset, origin uint,
+func (jpg *JpegDesc) checkExifSceneCaptureType( fType, fCount, fOffset, origin uint,
                                                 lEndian bool ) error {
-    if ifd != _EXIF {
-        return fmt.Errorf( "SceneCaptureType: tag used outside EXIF IFD\n" )
-    }
     fmtSceneCaptureType := func( v uint ) {
         var sctString string
         switch v {
@@ -1071,7 +1115,100 @@ func (jpg *JpegDesc) checkExifSceneCaptureType( ifd, fType, fCount, fOffset, ori
                                        fOffset, origin, fmtSceneCaptureType )
 }
 
-func (jpg*JpegDesc) checkExifLensSpecification( ifd, fType, fCount, fOffset, origin uint,
+func (jpg *JpegDesc) checkExifGainControl( fType, fCount, fOffset, origin uint,
+                                           lEndian bool ) error {
+    fmtGainControl := func( v uint ) {
+        var gcString string
+        switch v {
+        case 0 : gcString = "none"
+        case 1 : gcString = "Low gain up"
+        case 2 : gcString = "high gain up"
+        case 3 : gcString = "low gain down"
+        case 4 : gcString = "high gain down"
+        default:
+            fmt.Printf( "Illegal gain control (%d)\n", v )
+            return
+        }
+        fmt.Printf( "%s\n", gcString )
+    }
+    return jpg.checkTiffUnsignedShort( "GainControl", lEndian, fType, fCount,
+                                       fOffset, origin, fmtGainControl )
+}
+
+func (jpg *JpegDesc) checkExifContrast( fType, fCount, fOffset, origin uint,
+                                        lEndian bool ) error {
+    fmtContrast := func( v uint ) {
+        var cString string
+        switch v {
+        case 0 : cString = "Normal"
+        case 1 : cString = "Soft"
+        case 2 : cString = "Hard"
+        default:
+            fmt.Printf( "Illegal contrast (%d)\n", v )
+            return
+        }
+        fmt.Printf( "%s\n", cString )
+    }
+    return jpg.checkTiffUnsignedShort( "Contrast", lEndian, fType, fCount,
+                                       fOffset, origin, fmtContrast )
+}
+
+func (jpg *JpegDesc) checkExifSaturation( fType, fCount, fOffset, origin uint,
+                                        lEndian bool ) error {
+    fmtSaturation := func( v uint ) {
+        var sString string
+        switch v {
+        case 0 : sString = "Normal"
+        case 1 : sString = "Low saturation"
+        case 2 : sString = "High saturation"
+        default:
+            fmt.Printf( "Illegal Saturation (%d)\n", v )
+            return
+        }
+        fmt.Printf( "%s\n", sString )
+    }
+    return jpg.checkTiffUnsignedShort( "Saturation", lEndian, fType, fCount,
+                                       fOffset, origin, fmtSaturation )
+}
+
+func (jpg *JpegDesc) checkExifSharpness( fType, fCount, fOffset, origin uint,
+                                         lEndian bool ) error {
+    fmtSharpness := func( v uint ) {
+        var sString string
+        switch v {
+        case 0 : sString = "Normal"
+        case 1 : sString = "Soft"
+        case 2 : sString = "Hard"
+        default:
+            fmt.Printf( "Illegal Sharpness (%d)\n", v )
+            return
+        }
+        fmt.Printf( "%s\n", sString )
+    }
+    return jpg.checkTiffUnsignedShort( "Sharpness", lEndian, fType, fCount,
+                                       fOffset, origin, fmtSharpness )
+}
+
+func (jpg *JpegDesc) checkExifDistanceRange( fType, fCount, fOffset, origin uint,
+                                         lEndian bool ) error {
+    fmtSharpness := func( v uint ) {
+        var drString string
+        switch v {
+        case 0 : drString = "Unknown"
+        case 1 : drString = "Macro"
+        case 2 : drString = "Close View"
+        case 3 : drString = "Distant View"
+        default:
+            fmt.Printf( "Illegal Distance Range (%d)\n", v )
+            return
+        }
+        fmt.Printf( "%s\n", drString )
+    }
+    return jpg.checkTiffUnsignedShort( "DistanceRange", lEndian, fType, fCount,
+                                       fOffset, origin, fmtSharpness )
+}
+
+func (jpg*JpegDesc) checkExifLensSpecification( fType, fCount, fOffset, origin uint,
                                                 lEndian bool ) error {
 // LensSpecification is an array of ordered rational values:
 //  minimum focal length
@@ -1080,9 +1217,6 @@ func (jpg*JpegDesc) checkExifLensSpecification( ifd, fType, fCount, fOffset, ori
 //  maximum F number in maximum focal length
 //  which are specification information for the lens that was used in photography.
 //  When the minimum F number is unknown, the notation is 0/0.
-    if ifd != _EXIF {
-        return fmt.Errorf( "LensSpecification: tag used outside EXIF IFD\n" )
-    }
     if fCount != 4 {
         return fmt.Errorf( "LensSpecification: invalid count (%d)\n", fCount )
     }
@@ -1117,122 +1251,123 @@ func (jpg*JpegDesc) checkExifLensSpecification( ifd, fType, fCount, fOffset, ori
     return nil
 }
 
-func (jpg *JpegDesc) checkTiffField( ifd, tag, fType, fCount, fOffset, origin uint,
-                                     lEndian bool ) error {
-
-//    if tag < 0xfe {
-//        return fmt.Errorf( "checkTiffField: unkown tag (%#02x)\n", tag )
-//    }
-    // FIXME: check if valid in ifd
+func (jpg *JpegDesc) checkExifTag( ifd, tag, fType, fCount, fOffset, origin uint,
+                                   lEndian bool ) error {
     switch tag {
-    case _Compression:
-        return jpg.checkTiffCompression( ifd, fType, fCount, fOffset, origin, lEndian )
-    case _Make:
-        return jpg.checkTiffPrimaryThumbnailAscii( "Make", ifd, fType, fCount, fOffset, origin, lEndian )
-    case _Model:
-        return jpg.checkTiffPrimaryThumbnailAscii( "Model", ifd, fType, fCount, fOffset, origin, lEndian )
-
-    case _Orientation:
-        return jpg.checkTiffOrientation( ifd, fType, fCount, fOffset, origin, lEndian )
-    case _XResolution:
-        return jpg.checkTiffResolution( "XResolution", ifd, fType, fCount, fOffset, origin, lEndian )
-    case _YResolution:
-        return jpg.checkTiffResolution( "YResolution", ifd, fType, fCount, fOffset, origin, lEndian )
-
-    case _ResolutionUnit:
-        return jpg.checkTiffResolutionUnit( ifd, fType, fCount, fOffset, origin, lEndian )
-    case _Software:
-        return jpg.checkTiffPrimaryThumbnailAscii( "Software", ifd, fType, fCount, fOffset, origin, lEndian )
-    case _DateTime:
-        return jpg.checkTiffPrimaryThumbnailAscii( "Date", ifd, fType, fCount, fOffset, origin, lEndian )
-
-    case _YCbCrPositioning:
-        return jpg.checkTiffYCbCrPositioning( ifd, fType, fCount, fOffset, origin, lEndian )
-    case _Copyright:
-        return jpg.checkTiffPrimaryThumbnailAscii( "Copyright", ifd, fType, fCount, fOffset, origin, lEndian )
-
     case _ExposureTime:
-        return jpg.checkExifExposureTime( ifd, fType, fCount, fOffset, origin, lEndian )
+        return jpg.checkExifExposureTime( fType, fCount, fOffset, origin, lEndian )
     case _FNumber:
-        return jpg.checkExifFNumber( ifd, fType, fCount, fOffset, origin, lEndian )
+        return jpg.checkTiffUnsignedRational( "FNumber", lEndian, fType, fCount,
+                                               fOffset, origin, nil )
     case _ExposureProgram:
-        return jpg.checkExifExposureProgram( ifd, fType, fCount, fOffset, origin, lEndian )
+        return jpg.checkExifExposureProgram( fType, fCount, fOffset, origin, lEndian )
 
     case _ISOSpeedRatings:
-        return jpg.checkExifISOSpeedRatings( ifd, fType, fCount, fOffset, origin, lEndian )
+        return jpg.checkTiffUnsignedShorts( "ISOSpeedRatings", lEndian, fType, fCount,
+                                            fOffset, origin )
     case _ExifVersion:
-        return jpg.checkExifVersion( ifd, fType, fCount, fOffset, origin, lEndian )
+        return jpg.checkExifVersion( fType, fCount, fOffset, origin, lEndian )
 
     case _DateTimeOriginal:
-        return jpg.checkExifAscii( "DateTimeOriginal", ifd, fType, fCount, fOffset, origin, lEndian )
+        return jpg.checkTiffAscii( "DateTimeOriginal", lEndian, fType, fCount, fOffset, origin )
     case _DateTimeDigitized:
-        return jpg.checkExifAscii( "DateTimeDigitized", ifd, fType, fCount, fOffset, origin, lEndian )
+        return jpg.checkTiffAscii( "DateTimeDigitized", lEndian, fType, fCount, fOffset, origin )
 
-    case _ComponentsConfiguration:  // special case: tiff type is undefined, but it is bytes
-        return jpg.checkExifComponentsConfiguration( ifd, fType, fCount, fOffset, origin, lEndian )
+    case _ComponentsConfiguration:
+        return jpg.checkExifComponentsConfiguration( fType, fCount, fOffset, origin, lEndian )
+    case _CompressedBitsPerPixel:
+        return jpg.checkTiffUnsignedRational( "CompressedBitsPerPixel", lEndian, fType, fCount,
+                                              fOffset, origin, nil )
     case _ShutterSpeedValue:
-        return jpg.checkExifShutterSpeedValue( ifd, fType, fCount, fOffset, origin, lEndian )
+        return jpg.checkTiffSignedRational( "ShutterSpeedValue", lEndian, fType, fCount,
+                                             fOffset, origin, nil )
     case _ApertureValue:
-        return jpg.checkExifApertureValue( ifd, fType, fCount, fOffset, origin, lEndian )
-
+        return jpg.checkTiffUnsignedRational( "ApertureValue", lEndian, fType, fCount,
+                                               fOffset, origin, nil )
     case _BrightnessValue:
-        return jpg.checkExifBrightnessValue( ifd, fType, fCount, fOffset, origin, lEndian )
+        return jpg.checkTiffSignedRational( "BrightnessValue", lEndian, fType, fCount,
+                                            fOffset, origin, nil )
     case _ExposureBiasValue:
-        return jpg.checkExifExposureBiasValue( ifd, fType, fCount, fOffset, origin, lEndian )
+        return jpg.checkTiffSignedRational( "ExposureBiasValue", lEndian, fType, fCount,
+                                            fOffset, origin, nil )
+    case _MaxApertureValue:
+        return jpg.checkTiffUnsignedRational( "MaxApertureValue", lEndian, fType, fCount,
+                                              fOffset, origin, nil )
     case _MeteringMode:
-        return jpg.checkExifMeteringMode( ifd, fType, fCount, fOffset, origin, lEndian )
-
+        return jpg.checkExifMeteringMode( fType, fCount, fOffset, origin, lEndian )
+    case _LightSource:
+        return jpg.checkExifLightSource( fType, fCount, fOffset, origin, lEndian )
     case _Flash:
-        return jpg.checkExifFlash( ifd, fType, fCount, fOffset, origin, lEndian )
+        return jpg.checkExifFlash( fType, fCount, fOffset, origin, lEndian )
     case _FocalLength:
-        return jpg.checkExifFocalLength( ifd, fType, fCount, fOffset, origin, lEndian )
+        return jpg.checkTiffUnsignedRational( "FocalLength", lEndian, fType, fCount,
+                                               fOffset, origin, nil )
     case _SubjectArea:
-        return jpg.checkExifSubjectArea( ifd, fType, fCount, fOffset, origin, lEndian )
+        return jpg.checkExifSubjectArea( fType, fCount, fOffset, origin, lEndian )
 
     case _MakerNote:
-        return jpg.checkExifMakerNote( ifd, fType, fCount, fOffset, origin, lEndian )
+        return jpg.checkExifMakerNote( fType, fCount, fOffset, origin, lEndian )
+    case _UserComment:
+        return jpg.checkExifUserComment( fType, fCount, fOffset, origin, lEndian )
+    case _SubsecTime:
+        return jpg.checkTiffAscii( "SubsecTime", lEndian, fType, fCount, fOffset, origin )
     case _SubsecTimeOriginal:
-        return jpg.checkExifAscii( "SubsecTimeOriginal", ifd, fType, fCount, fOffset, origin, lEndian )
+        return jpg.checkTiffAscii( "SubsecTimeOriginal", lEndian, fType, fCount, fOffset, origin )
     case _SubsecTimeDigitized:
-        return jpg.checkExifAscii( "SubsecTimeDigitized", ifd, fType, fCount, fOffset, origin, lEndian )
+        return jpg.checkTiffAscii( "SubsecTimeDigitized", lEndian, fType, fCount, fOffset, origin )
     case _FlashpixVersion:
-        return jpg.checkFlashpixVersion( ifd, fType, fCount, fOffset, origin, lEndian )
+        return jpg.checkFlashpixVersion( fType, fCount, fOffset, origin, lEndian )
 
     case _ColorSpace:
-        return jpg.checkExifColorSpace( ifd, fType, fCount, fOffset, origin, lEndian )
+        return jpg.checkExifColorSpace( fType, fCount, fOffset, origin, lEndian )
     case _PixelXDimension:
-        return jpg.checkExifDimension( "PixelXDimension", ifd, fType, fCount, fOffset, origin, lEndian )
+        return jpg.checkExifDimension( "PixelXDimension", fType, fCount, fOffset, origin, lEndian )
     case _PixelYDimension:
-        return jpg.checkExifDimension( "PixelYDimension", ifd, fType, fCount, fOffset, origin, lEndian )
+        return jpg.checkExifDimension( "PixelYDimension", fType, fCount, fOffset, origin, lEndian )
 
     case _SensingMethod:
-        return jpg.checkExifSensingMethod( ifd, fType, fCount, fOffset, origin, lEndian )
+        return jpg.checkExifSensingMethod( fType, fCount, fOffset, origin, lEndian )
+    case _FileSource:
+        return jpg.checkExifFileSource( fType, fCount, fOffset, origin, lEndian )
     case _SceneType:
-        return jpg.checkExifSceneType( ifd, fType, fCount, fOffset, origin, lEndian )
+        return jpg.checkExifSceneType( fType, fCount, fOffset, origin, lEndian )
+    case _CFAPattern:
+        return jpg.checkExifCFAPattern( fType, fCount, fOffset, origin, lEndian )
+    case _CustomRendered:
+        return jpg.checkExifCustomRendered( fType, fCount, fOffset, origin, lEndian )
     case _ExposureMode:
-        return jpg.checkExifExposureMode( ifd, fType, fCount, fOffset, origin, lEndian )
+        return jpg.checkExifExposureMode( fType, fCount, fOffset, origin, lEndian )
     case _WhiteBalance:
-        return jpg.checkExifWhiteBalance( ifd, fType, fCount, fOffset, origin, lEndian )
+        return jpg.checkExifWhiteBalance( fType, fCount, fOffset, origin, lEndian )
     case _DigitalZoomRatio:
-        return jpg.checkExifDigitalZoomRatio( ifd, fType, fCount, fOffset, origin, lEndian )
+        return jpg.checkExifDigitalZoomRatio( fType, fCount, fOffset, origin, lEndian )
     case _FocalLengthIn35mmFilm:
-        return jpg.checkExifFocalLengthIn35mmFilm( ifd, fType, fCount, fOffset, origin, lEndian )
-
+        return jpg.checkTiffUnsignedShort( "FocalLengthIn35mmFilm", lEndian, fType, fCount,
+                                           fOffset, origin, nil )
     case _SceneCaptureType:
-        return jpg.checkExifSceneCaptureType( ifd, fType, fCount, fOffset, origin, lEndian )
+        return jpg.checkExifSceneCaptureType( fType, fCount, fOffset, origin, lEndian )
+    case _GainControl:
+        return jpg.checkExifGainControl( fType, fCount, fOffset, origin, lEndian )
+    case _Contrast:
+        return jpg.checkExifContrast( fType, fCount, fOffset, origin, lEndian )
+    case _Saturation:
+        return jpg.checkExifSaturation( fType, fCount, fOffset, origin, lEndian )
+    case _Sharpness:
+        return jpg.checkExifSharpness( fType, fCount, fOffset, origin, lEndian )
+    case _SubjectDistanceRange:
+        return jpg.checkExifDistanceRange( fType, fCount, fOffset, origin, lEndian )
     case _LensSpecification:
-        return jpg.checkExifLensSpecification( ifd, fType, fCount, fOffset, origin, lEndian )
+        return jpg.checkExifLensSpecification( fType, fCount, fOffset, origin, lEndian )
     case _LensMake:
-        return jpg.checkExifAscii( "LensMake", ifd, fType, fCount, fOffset, origin, lEndian )
+        return jpg.checkTiffAscii( "LensMake", lEndian, fType, fCount, fOffset, origin )
     case _LensModel:
-        return jpg.checkExifAscii( "LensModel", ifd, fType, fCount, fOffset, origin, lEndian )
-        
+        return jpg.checkTiffAscii( "LensModel", lEndian, fType, fCount, fOffset, origin )
     }
-    return fmt.Errorf( "checkTiffField: unknown or unsupported tag (%#02x) @offset %#04x count %d\n",
+    return fmt.Errorf( "checkExifTag: unknown or unsupported tag (%#02x) @offset %#04x count %d\n",
                        tag, fOffset, fCount )
 }
 
-const (
+const (                                     // _GPS IFD specific tags
     _GPSVersionID           = 0x00
     _GPSLatitudeRef         = 0x01
     _GPSLatitude            = 0x02
@@ -1266,15 +1401,64 @@ const (
     _GPSDifferential        = 0x1e
 )
 
-const (
-    _InteroperabilityIndex  = 0x01
-)
-
-func (jpg *JpegDesc) checkPrivateTiffField( tag, fType, fCount, fOffset, origin uint,
-                                            lEndian, gps bool ) error {
-    // TODO
+func (jpg *JpegDesc) checkGPSVersionID( fType, fCount, fOffset, origin uint,
+                                        lEndian bool ) error {
+    if fCount != 4 {
+        return fmt.Errorf( "GPSVersionID: invalid count (%d)\n", fCount )
+    }
+    if fType != _UnsignedByte {
+        return fmt.Errorf( "GPSVersionID: invalid type (%s)\n", getTiffTString( fType ) )
+    }
+    slc := jpg.getBytes( fOffset, fCount )  // 4 bytes fit in directory entry
+    fmt.Printf("    GPSVersionID: %d.%d.%d.%d\n", slc[0], slc[1], slc[2], slc[3] )
     return nil
 }
+
+func (jpg *JpegDesc) checkGpsTag( ifd, tag, fType, fCount, fOffset, origin uint,
+                                  lEndian bool ) error {
+    switch tag {
+    case _GPSVersionID:
+        return jpg.checkGPSVersionID( fType, fCount, fOffset, origin, lEndian )
+    }
+    return fmt.Errorf( "checkGpsTag: unknown or unsupported tag (%#02x) @offset %#04x count %d\n",
+                       tag, fOffset, fCount )
+}
+
+const (                                     // _IOP IFD tags
+    _InteroperabilityIndex      = 0x01
+    _InteroperabilityVersion    = 0x02
+)
+
+func (jpg *JpegDesc) checkInteroperabilityVersion( fType, fCount, fOffset, origin uint,
+                                                   lEndian bool ) error {
+    if fType != _Undefined {
+        return fmt.Errorf( "InteroperabilityVersion: invalid type (%s)\n", getTiffTString( fType ) )
+    }
+    // assume bytes
+    bs := jpg.getBytesFromIFD( lEndian, fCount, fOffset, origin )
+    fmt.Printf( "    InteroperabilityVersion: %#02x, %#02x, %#02x, %#02x\n",
+                bs[0], bs[1], bs[2], bs[3] )
+    return nil
+}
+
+func (jpg *JpegDesc) checkIopTag( ifd, tag, fType, fCount, fOffset, origin uint,
+                                  lEndian bool ) error {
+    switch tag {
+    case _InteroperabilityIndex:
+        return jpg.checkTiffAscii( "Interoperability", lEndian, fType, fCount, fOffset, origin )
+    case _InteroperabilityVersion:
+        return jpg.checkInteroperabilityVersion( fType, fCount, fOffset, origin, lEndian )
+    default:
+        fmt.Printf( "    unknown or unsupported tag (%#02x) @offset %#04x type %s count %d\n",
+                    tag, fOffset, getTiffTString( fType), fCount )
+    }
+//    return fmt.Errorf( "checkIopTag: unknown or unsupported tag (%#02x) @offset %#04x count %d\n",
+//                       tag, fOffset, fCount )
+    return nil
+}
+
+var IfdNames [5]string = [...]string{ "Primary Image data", "Thumbnail Image data",
+                                      "Exif data", "GPS data", "Interoperability data" }
 
 func (jpg *JpegDesc) checkIFD( Ifd, IfdOffset, origin uint, tag1, tag2 int,
                                lEndian bool ) ( offset0, offset1, offset2 uint, err error) {
@@ -1284,6 +1468,13 @@ func (jpg *JpegDesc) checkIFD( Ifd, IfdOffset, origin uint, tag1, tag2 int,
     offset2 = 0
     err = nil
 
+    var checkTags func( Ifd, tag, fType, fCount, fOffset, origin uint, lEndian bool ) error
+    switch Ifd {
+    case _PRIMARY, _THUMBNAIL:  checkTags = jpg.checkTiffTag
+    case _EXIF:                 checkTags = jpg.checkExifTag
+    case _GPS:                  checkTags = jpg.checkGpsTag
+    case _IOP:                  checkTags = jpg.checkIopTag
+    }
     /*
         Image File Directory starts with the number of following directory entries (2 bytes)
         followed by that number of entries (12 bytes) and one extra offset to the next IFD
@@ -1291,9 +1482,9 @@ func (jpg *JpegDesc) checkIFD( Ifd, IfdOffset, origin uint, tag1, tag2 int,
     */
     nIfdEntries := jpg.getUnsignedShort( lEndian, IfdOffset )
     if jpg.Content {
-//        fmt.Printf( "  IFD #%d %s @%#04x #entries %d\n", ifd,
-//                    IfdNames[Ifd], IfdOffset, nIfdEntries )
-        fmt.Printf( "  %s:\n", IfdNames[Ifd] )
+        fmt.Printf( "  IFD #%d %s @%#04x #entries %d\n", Ifd,
+                    IfdNames[Ifd], IfdOffset, nIfdEntries )
+//        fmt.Printf( "  %s:\n", IfdNames[Ifd] )
     }
 
     IfdOffset += 2
@@ -1307,10 +1498,10 @@ func (jpg *JpegDesc) checkIFD( Ifd, IfdOffset, origin uint, tag1, tag2 int,
         } else if tag2 != -1 && tiffTag == uint(tag2) {
             offset2 = jpg.getUnsignedLong( lEndian, IfdOffset + 8 )
         } else {
-            err := jpg.checkTiffField( Ifd, tiffTag, tiffType, tiffCount,
-                                       IfdOffset + 8, origin, lEndian )
+            err := checkTags( Ifd, tiffTag, tiffType, tiffCount,
+                              IfdOffset + 8, origin, lEndian )
             if err != nil {
-                return 0, 0, 0, fmt.Errorf( "TIFF: invalid field: %v\n", err )
+                return 0, 0, 0, fmt.Errorf( "checkIFD: invalid field: %v\n", err )
             }
         }
         IfdOffset += 12
@@ -1318,8 +1509,6 @@ func (jpg *JpegDesc) checkIFD( Ifd, IfdOffset, origin uint, tag1, tag2 int,
     offset0 = jpg.getUnsignedLong( lEndian, IfdOffset )
     return
 }
-
-var IfdNames [4]string = [...]string{ "Primary Image data", "Thumbnail Image data", "Exif data", "GPS data" }
 
 func (jpg *JpegDesc) exifApplication( sLen uint ) error {
     if jpg.Content {
@@ -1370,8 +1559,14 @@ func (jpg *JpegDesc) exifApplication( sLen uint ) error {
         */
     }
 
+    var ioIFDopOffset uint
     if exifIFDOffset != 0 {
-        _, _, _, err = jpg.checkIFD( _EXIF, exifIFDOffset, origin, -1, -1, lEndian )
+        _, ioIFDopOffset, _, err = jpg.checkIFD( _EXIF, exifIFDOffset, origin, _InteroperabilityIFD, -1, lEndian )
+        if err != nil { return err }
+    }
+
+    if ioIFDopOffset != 0 {
+        _, _, _, err = jpg.checkIFD( _IOP, ioIFDopOffset, origin, -1, -1, lEndian )
         if err != nil { return err }
     }
 
