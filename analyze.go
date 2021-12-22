@@ -1659,6 +1659,7 @@ func Analyze( data []byte, toDo *Control ) ( *JpegDesc, error ) {
 	}
 
     tLen := uint(len(data))
+makerLoop:
     for i := uint(0); i < tLen; {
         marker := uint(data[i]) << 8 + uint(data[i+1])
         sLen := uint(0)       // case of a segment without any data
@@ -1691,7 +1692,7 @@ func Analyze( data []byte, toDo *Control ) ( *JpegDesc, error ) {
             jpg.state = _FINAL
             jpg.offset = i + 2  // points after the last byte
             if jpg.Fix { jpg.fixLines( ) }
-            break
+            break makerLoop // exit even if there is junk at the end of the file
 
         default:        // all other cases have data following marker & length
             sLen = uint(data[i+2]) << 8 + uint(data[i+3])
