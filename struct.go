@@ -1,8 +1,6 @@
 // Package jpeg provides a few primitives to parse and analyse a JPEG image
 package jpeg
 
-// common constants, data structures and helper functions
-
 import (
     "fmt"
 )
@@ -245,8 +243,8 @@ type JpegDesc struct {
     qdefs           [4]qdef     // Quantization zig-zag coefficients for 4 dest
     hdefs           [8]hdef     // Huffman code definition for 4 dest * (DC+AC)
 
-    tables          []segment   // frame tables: APP0(s) followed by optional
-                                // tables and 1 terminating SOFn
+    apps            []app       // APP0(s), APP1, ...
+    tables          []segment   // frame optional tables and 1 terminating SOFn
     components      []component // from SOFn component definitions
                                 // note: component order is Y [, Cb, Cr] in SOFn
     resolution      sampling    // luminance (greyscale) or YCbCr picture

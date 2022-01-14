@@ -83,8 +83,11 @@ func (jpg *JpegDesc) getMcuDesc( sComp *[]scanCompRef ) *mcuDesc {
         cmp := jpg.components[i]                        // ignore sc.CMId (order is fixed)
         mcu.sComps[i].hDC = jpg.hdefs[2*sc.DCId].root   // AC follows DC
         mcu.sComps[i].hAC = jpg.hdefs[2*sc.ACId+1].root // (2 tables per dest)
-        nUnitsRow := ((jpg.resolution.nSamplesLine / jpg.resolution.mhSF) *
-                      cmp.hSF)/8
+        nUnitsRow := (jpg.resolution.nSamplesLine / jpg.resolution.mhSF) *
+                      cmp.hSF
+        if nUnitsRow % 8 != 0 { nUnitsRow += 7 }        // round up to next unit
+
+        nUnitsRow /= 8
         nUnitsRstInt := jpg.nMcuRST * cmp.hSF
         if nUnitsRstInt > nUnitsRow {
             nUnitsRow = nUnitsRstInt
@@ -846,7 +849,7 @@ func (jpg *JpegDesc) processECS( nMCUs uint) (uint, error) {
     scan := jpg.getCurrentScan()
     if scan == nil { panic("Internal error (no scan for ECS)\n") }
 
-    /*  after ach RST, reset previousDC, dUAnchor, dUCol, dURow & count
+    /*  after each RST, reset previousDC, dUAnchor, dUCol, dURow & count
         for each scan component (Y[,Cb,Cr]) */
     for i := len(scan.mcuD.sComps)-1; i >= 0; i-- {
         scan.mcuD.sComps[i].previousDC = 0
@@ -1829,6 +1832,10 @@ func (jpg *JpegDesc)flatten( w io.Writer ) (int, error) {
     if err != nil { return written, jpgForwardError( "flatten", err ) }
 
     var n int
+    n, err = jpg.writeApps( w )
+    if err != nil { return written, jpgForwardError( "flatten", err ) }
+    written += n
+
     for index := range( jpg.tables )  {
         n, err = jpg.writeSegment( w, &jpg.tables[index] )
         written += n
@@ -1865,18 +1872,17 @@ func (jpg *JpegDesc) Generate( ) ( []byte, error ) {
 // Write stores the possibly fixed JEPG data into a file.
 // The argument path is the new file path.
 // If the file exists already, new content will replace the existing one.
-func (jpg *JpegDesc)Write( path string ) error {
+func (jpg *JpegDesc)Write( path string ) (err error) {
     if ! jpg.IsComplete() {
         return fmt.Errorf( "Write: Data is not a complete JPEG\n" )
     }
 
+    defer func ( ) { if err != nil { err = jpgForwardError( "Write", err ) } }()
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, os.ModePerm)
-    if err != nil { return jpgForwardError( "Write", err ) }
-
-    _, err = jpg.flatten( f )
-    if err != nil { return jpgForwardError( "Write", err ) }
-
-    if err = f.Close( ); err != nil { return jpgForwardError( "Write", err ) }
-    return nil
+    if err == nil {
+        defer func ( ) { if e := f.Close( ); err == nil { err = e } }()
+        _, err = jpg.flatten( f )
+    }
+    return
 }
 

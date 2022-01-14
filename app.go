@@ -6,10 +6,57 @@ import (
     "fmt"
     "bytes"
     "github.com/jrm-1535/exif"
+    "io"
 )
 
-// app0 support
+// appMetadata interface for all apps
+type appMetadata interface {
+    serialize( w io.Writer ) (int, error)
+    format( w io.Writer ) error
+    remove( id int, tag int ) error
+    parseThumbnails( ) error
+}
 
+type appId  uint
+const (
+    JFIF appId = iota
+    EXIF
+)
+
+type app struct {
+    id              appId
+    data            []appMetadata
+}
+
+func (jpg *JpegDesc) storeApp( id appId, data appMetadata ) {
+    for _, app := range jpg.apps {
+        if app.id == id {
+            app.data = append( app.data, data )
+            return
+        }
+    }
+    jpg.apps = append( jpg.apps, app{ id, []appMetadata{ data } } )
+}
+
+func (jpg *JpegDesc) writeApps( w io.Writer ) (written int, err error) {
+
+    defer func() { if err != nil {err = fmt.Errorf( "writeApps: %v", err )} }()
+
+    var n int
+    for _, app := range jpg.apps {
+        for _, md := range( app.data ) {
+            n, err = md.serialize( w )
+            if err != nil {
+                return
+            }
+            written += n
+        }
+    }
+    return
+}
+
+
+// app0 support
 const (                             // Image resolution units (prefixed with _ to avoid being documented)
     _DOTS_PER_ARBITRARY_UNIT = 0    // undefined unit
     _DOTS_PER_INCH = 1              // DPI
@@ -120,6 +167,11 @@ func (jpg *JpegDesc) app0( marker, sLen uint ) error {
 
 // app1 support (Exif, XMP)
 
+const (
+    _APP1_EXIF = iota
+    _APP1_XMP
+)
+
 func (jpg *JpegDesc) xmpApplication( offset, sLen uint ) error {
     if jpg.Content {
         fmt.Printf( "APP1 (XMP)\n" )
@@ -131,34 +183,72 @@ func (jpg *JpegDesc) xmpApplication( offset, sLen uint ) error {
     return nil
 }
 
-const (
-    _APP1_EXIF = iota
-    _APP1_XMP
-)
+type exifData struct {
+    desc *exif.Desc
+}
+
+func (ed *exifData) serialize( w io.Writer) (int, error) {
+    return ed.desc.Serialize( w )
+}
+
+func (ed *exifData) format( w io.Writer) error {
+    return ed.desc.Format( w )
+}
+
+func (ed *exifData) remove( id int, tag int ) error {
+    return ed.desc.Remove( exif.IfdId(id), tag )
+}
+
+func (ed *exifData)parseThumbnails( ) (err error) {
+
+    var toClose bool
+    eThbns := ed.desc.GetThumbnailInfo()
+
+    defer func( ) {
+        if err != nil { err = fmt.Errorf( "parseThumbnails: %v", err ) }
+    }()
+    for i, thbn := range eThbns {
+        fmt.Printf( "Thumbnail #%d: type %s, size %d in %s IFD\n",
+                    i, exif.GetCompressionName(thbn.Comp),
+                    thbn.Size, exif.GetIfdName(thbn.Origin) )
+
+        if thbn.Comp == exif.JPEG {   // decode thumbnail if in JPEG
+            var data []byte
+            data, err = ed.desc.GetThumbnailData( thbn.Origin );
+            if err != nil {
+                return
+            }
+            fmt.Printf( "============= Thumbnail JPEG picture ================\n" )
+            toClose = true
+            _, err = Analyze( data, &Control{ Markers: true, Content: true } )
+            if err != nil {
+                return
+            }
+        }
+    }
+    if toClose {
+        fmt.Printf( "================== Main JPEG picture ==================\n" )
+    }
+    return nil
+}
 
 func (jpg *JpegDesc) exifApplication( offset, sLen uint ) error {
-    ec := exif.Control{ Print: true }
-    ed, err := exif.Parse( jpg.data, offset, sLen, &ec )
+    ec := exif.Control{ Unknown: exif.KeepTag, Warn: true }
+    d, err := exif.Parse( jpg.data, offset, sLen, &ec )
 
-    if err != nil {
-        thbOffset, thbLen, thbType := ed.GetThumbnail()
-        if thbType == exif.JPEG {   // decode thumbnail if in JPEG
-            thbOffset += offset
+    if err == nil {
+        ed := new( exifData )
+        ed.desc = d
+        jpg.storeApp( EXIF, ed )
 
-            fmt.Printf( "============= Thumbnail JPEG picture ================\n" )
-            _, tnErr := Analyze( jpg.data[thbOffset:thbOffset+thbLen],
-                                 &Control{ Markers: true, Content: true } )
-            fmt.Printf( "======================================================\n" )
-            if tnErr != nil {
-                return err
+        if jpg.Content {
+
+            if err = ed.parseThumbnails(); err != nil {
+                return fmt.Errorf( "exifApplication: %v", err )
             }
-            // save thumbnail
-            /*
-                f, ferr := os.OpenFile("thbnail", os.O_CREATE|os.O_TRUNC|os.O_WRONLY, os.ModePerm)
-                if ferr != nil { return jpgForwardError( "Write", err ) }
-                _, ferr = f.Write( data[thbOffset:thbOffset+thbLength] )
-                if ferr = f.Close( ); ferr != nil { return jpgForwardError( "Write", err ) }
-            */
+            if err = d.Format( nil ); err != nil {
+                return fmt.Errorf( "exifApplication: %v", err )
+            }
         }
     }
     return err
@@ -187,9 +277,9 @@ func (jpg *JpegDesc) app1( marker, sLen uint ) error {
     var err error
     switch appType {
     case _APP1_EXIF:
-        err = jpg.exifApplication( offset, sLen )
+        err = jpg.exifApplication( offset, sLen-2 )
     case _APP1_XMP:
-        err = jpg.xmpApplication( offset, sLen )
+        err = jpg.xmpApplication( offset, sLen-2 )
     default:
         err = fmt.Errorf( "app1: Wrong APP1 header (%s)\n", jpg.data[offset:offset+6] )
     }
