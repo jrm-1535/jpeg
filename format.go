@@ -5,10 +5,14 @@ import (
     "io"
 )
 
+// GetImageInfo returns the framing information, whether it is a single frame
+// (sequential or progressive) or multiple frames (hierarchical)
 func (j *Desc)GetImageInfo( ) Framing {
     return j.process
 }
-
+// FormatImageInfo formats and writes the image framing information, whether
+// it is  a single frame (sequential or progressive) or multiple frames
+// (hierarchical)
 func (j *Desc)FormatImageInfo( w io.Writer ) (n int, err error) {
     if j.process == HierarchicalFrames {
         n, err = fmt.Fprintf( w, "Image Info: %d Hierarchical Frames\n",
@@ -22,11 +26,9 @@ func (j *Desc)FormatImageInfo( w io.Writer ) (n int, err error) {
 type FrameInfo struct {
     Mode            EncodingMode    // baseline, sequential, progressive, lossless
     Entropy         EntropyCoding   // Huffman or arithmetic coding
-
     SampleSize      uint            // number of bits per pixel
     Width, Height   uint            // image size in pixels
-
-    Components      []Component
+    Components      []Component     // frame components
 }
 
 // GetFrameInfo returns encoding information about a specific frame, indentified
@@ -366,16 +368,17 @@ const (
 // tables or Arithmetic coding tables) and Scan tables (entropy coded segments).
 //
 // Since usually multiple tables exists, an index n is used to specify which
-// table must be processed. AN index of -1 indicates all tables in sequence.
+// table must be processed. An index of -1 indicates all tables in sequence.
 //
 // For each encoding table class (Quantization, Entropy or Scan) the sequence
 // is defined as:
 //
-// Quantization: destination [0-3] DCT coefficients
+// Quantization: n = destination [0-3] DCT coefficients
 //
-// Entropy: class DC [0-3], class AC [4-7], either Huffman or Arithmetic coding
+// Entropy: n = class DC [0-3], class AC [4-7], either Huffman or Arithmetic
+// coding
 //
-// Scan: scan segment [0-n]
+// Scan: n = scan segment
 //
 // Formatting those tables is done accoding to the requested mode (Standard,
 // Extra or Both).
@@ -400,9 +403,9 @@ func (j *Desc)FormatEncodingTable( w io.Writer, frame uint, t EncodingTable,
 
 // formatMetadata formats and writes the requested metadata for a given appId.
 // The optional slice of sub-ids is intended for cases where the app segment
-// contains multiple containers associated with those sub-ids. The slice gives
-// the specific containers to write. If the slice is missing the whole app
-// segment is written. 
+// contains multiple containers associated with those sub-ids, such as app1
+// used for EXIF. The slice gives the specific containers to write. If the
+// slice is missing the whole app segment is written.
 func (j *Desc)FormatMetadata( w io.Writer, appId int, sIds []int ) (n int, err error) {
     for _, seg := range j.segments {
         if s, ok := seg.(metadata); ok {

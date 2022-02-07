@@ -574,7 +574,7 @@ func (jpg *Desc)printMarker( marker, sLen, offset uint ) {
 type Control struct {       // control parsing verbosity
     Warn            bool    // Warn about inconsistencies as they are seen
     Recurse         bool    // Recurse and parse embedded JPEG pictures
-    TidyUp          bool
+    TidyUp          bool    // Fix and clean up JPEG segments
     Markers         bool    // show JPEG markers as they are parsed
     Mcu             bool    // display MCUs as they are parsed
     Du              bool    // display each DU resulting from MCU parsing
@@ -583,13 +583,13 @@ type Control struct {       // control parsing verbosity
 
 // Parse analyses jpeg data and splits the data into well-known segments.
 // The argument toDo indicates how parsing should be done (Resurse) and what
-// information should be printed during parsing (Warning, Narkers, Mcu, Du).
-// It can also request the possible errors be corrected and that unnecessary
+// information should be printed during parsing (Warning, Markers, Mcu, Du).
+// It can also request that possible errors be corrected and that unnecessary
 // segments be removed (TidyUp).
 //
 // What can be corrected:
 //
-//  - if the last RSTn is ending a scan it is not necessary and it may cause a
+//  - if the last RSTn is ending a scan, it is not necessary and it may cause a
 //  renderer to fail. It is removed from the scan.
 //
 //  - if a DNL table is found after an ECS and if the number of lines given in
@@ -718,13 +718,13 @@ makerLoop:
 
 // IsComplete returns true if the current JPEG data makes a complete JPEG file,
 // from SOI to EOI. It does not guarantee that the data corresponds to a valid
-// JPEG image
+// JPEG image that can be used with any decoder.
 func (jpg *Desc) IsComplete( ) bool {
     return jpg.state == _FINAL
 }
 
-// GetNumberOfFrames returns the number of frames in the file, which can be 0,
-// 1 (most common case) or more in case of hierarchical frames.
+// GetNumberOfFrames returns the number of frames in the file, which can be 0
+// (most common case), or more in case of hierarchical frames.
 func (jpg *Desc) GetNumberOfFrames( ) uint {
     return uint(len(jpg.frames))
 }
@@ -745,11 +745,11 @@ func (jpg *Desc) GetActualLengths( ) ( actual uint, original uint ) {
     return uint(size), dataSize
 }
 
-//  RemoveMetadata removes app segments: arg indicates which metadata to remove.
-//  A first id (appId) specifies the app segment containing metadata (-1 for all
+//  RemoveMetadata removes metadata:
+//  a first id (appId) specifies the app segment containing metadata (-1 for all
 //  apps, or a list of specific app ids to remove, in the the range 0 to 15).
 //  The following list of ids indicates which containers inside the app segment
-//  to remove. This is intended for app segment such as app1 used for EXIF,
+//  to remove. This is intended for app segments, such as app1 used for EXIF,
 //  which contains up to 6 ifds, in the range 1 to 6. If that list of ids is
 //  missing the whole app segment is removed.
 func (jpg *Desc)RemoveMetadata( appId int, sIds []int ) (err error) {
@@ -865,12 +865,11 @@ func (jpg *Desc)Write( path string ) (n int, err error) {
 }
 
 /*
-    Read reads a JPEG file in memory, and starts analysing its content.
-    The argument path is the existing file path.
-    The argument toDo provides information about how to analyse the document
-    If toDo.Fix is true, ReadJped fixes some common issues in jpeg data by
-    writing the modified data in memory, so that they can be stored later by
-    calling Write or Generate.
+    Read reads a JPEG file in memory, and parses its content. The argument path
+    is the existing file path. The argument toDo provides information about how
+    to analyse the document. If toDo.TidyUp is true, Read fixes some common
+    issues in jpeg data by updating data in memory, so that they can be stored
+    later by calling Write or Generate.
 
     It returns a tuple: a pointer to a Desc containing the segment
     definitions and an error. If the file cannot be read the returned Desc
