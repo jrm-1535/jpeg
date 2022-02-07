@@ -1,17 +1,11 @@
-// Package jpeg provides a few primitives to parse and analyse a JPEG image
 package jpeg
 
 import (
     "fmt"
     "bytes"
-    "os"
     "io"
-    "io/ioutil"
+    "encoding/binary"
 )
-
-type scanCompRef struct {      // scan component reference
-    CMId, DCId, ACId uint
-}
 
 /*
     MCU is Minimum Coded Unit
@@ -74,1124 +68,436 @@ type scanCompRef struct {      // scan component reference
     following samples are 0 and any non-zero sample can be preceded by up to
     15 zero samples.
 */
-func (jpg *JpegDesc) getMcuDesc( sComp *[]scanCompRef ) *mcuDesc {
+
+type scanCompRef struct {      // scan component reference
+    cmId, dcId, acId uint8
+}
+
+func (jpg *Desc) newMcuDesc( sComp *[]scanCompRef ) *mcuDesc {
 
     mcu := new(mcuDesc)
     mcu.sComps = make( []scanComp, len(*sComp) )
 
+    fl := len( jpg.frames)
+    if fl == 0 { panic( "No frame for scan\v" ) }
+
+    frm := jpg.getCurrentFrame()
     for i, sc := range( *sComp ) {
-        cmp := jpg.components[i]                        // ignore sc.CMId (order is fixed)
-        mcu.sComps[i].hDC = jpg.hdefs[2*sc.DCId].root   // AC follows DC
-        mcu.sComps[i].hAC = jpg.hdefs[2*sc.ACId+1].root // (2 tables per dest)
-        nUnitsRow := (jpg.resolution.nSamplesLine / jpg.resolution.mhSF) *
-                      cmp.hSF
+        cmp := frm.components[i]                        // ignore sc.cmId (order is fixed)
+        mcu.sComps[i].hDC = jpg.hdefs[2*sc.dcId].root   // AC follows DC
+        mcu.sComps[i].hAC = jpg.hdefs[2*sc.dcId+1].root // (2 tables per dest)
+        nUnitsRow := (uint(frm.resolution.nSamplesLine) / uint(frm.resolution.mhSF)) *
+                      uint(cmp.HSF)
         if nUnitsRow % 8 != 0 { nUnitsRow += 7 }        // round up to next unit
 
         nUnitsRow /= 8
-        nUnitsRstInt := jpg.nMcuRST * cmp.hSF
+        nUnitsRstInt := jpg.nMcuRST * uint(cmp.HSF)
         if nUnitsRstInt > nUnitsRow {
             nUnitsRow = nUnitsRstInt
         }
         mcu.sComps[i].nUnitsRow = nUnitsRow
-        mcu.sComps[i].hSF = cmp.hSF
-        mcu.sComps[i].vSF = cmp.vSF
+        mcu.sComps[i].hSF = uint(cmp.HSF)
+        mcu.sComps[i].vSF = uint(cmp.VSF)
         // preallocate vSF * nUnitsLine for this component
-        mcu.sComps[i].dUnits = make( [][64]int, cmp.vSF * nUnitsRow )
+        mcu.sComps[i].dUnits = make( [][64]int, uint(cmp.VSF) * nUnitsRow )
         // previousDC, dUCol, dURow, dUAnchor, nRows, count are set to 0
+        mcu.sComps[i].cId = sc.cmId
+        mcu.sComps[i].dcId = sc.dcId
+        mcu.sComps[i].acId = sc.acId
+        mcu.sComps[i].quId = frm.components[i].QS
+        mcu.sComps[i].quSz = uint8(jpg.qdefs[frm.components[i].QS].size)
     }
     return mcu      // initially count is 0
 }
 
-func getMcuFormat( sc *scan ) string {
+func subsamplingFormat( sc *scan ) string {
+    // Chroma subsampling formula (4:a:b), where:
+    // 4 is fixed number of Y samples per line and 2 is fixed number of lines
+    // a is the number of CbCr samples in the 1st line
+    // b is the number of changes between 1st and 2nd line
+    // The assumption for Chroma subsampling is that numbers for Chroma are at
+    // best the same as for Luma, but usually lower.
+    // In JPEG, Y, Cb, Cr are given as Horizontal & Vertical sampling factors
+    // Different values for Cb and Cr are possible, and in theory they could be
+    // higher than those for Luma. This would not be expressible with the
+    // standard subsampling formula: Cb and Cr must have the same sampling
+    // factors to fit in the formula. The sampling factors that are compatible
+    // with the standard subsampling formula are:
+    // Y(1:1), Cb(1:1), Cr(1:1) => 4:4:4 No subsampling
+    // Y(1:2), Cb(1:1), Cr(1:1) => 4:4:0 Chroma 1/2 vertically
+    // Y(2:1), Cb(1:1), Cr(1:1) => 4:2:2 Chroma 1/2 horizontally
+    // Y(2:2), Cb(1:1), Cr(1:1) => 4:2:0 Chroma 1/2 vertically & horizontally
+    // Y(4:1), Cb(1:1), Cr(1:1) => 4:1:1 Chroma 1/4 horizontally
+    // Y(4:2), Cb(1:1), Cr(1:1) => 4:1:0 Chroma 1/2 vertically 1/4 horizontally
+    // Where Component(n:m) indicates the component H:V sampling factor
+    //
+    // The number of Y samples is fixed to 4, so if nLuma is not 4 a coefficient
+    // must be applied for the number of chroma samples (4/LumaS). The number of
+    // chroma changes between the first and second line is indicated by the
+    // chroma vertical sampling factor -1 (if the sampling factor is 1, there
+    // is no change between the 2 lines). However, if the Y vertical sampling
+    // factor is not 2, the coefficient 2/nLumaLines must be applied:
+    // Therefore: a = (chromaS * 4) / lumaS
+    //            b = a * (((chromaL * 2) / lumaL) - 1)
+    // Those formula could work for any nluma and nlumaLines above 4 and 3, but
+    // the calculation would have to be done in float, before being turned back
+    // to integers.
+    if len( sc.mcuD.sComps ) < 2 {
+        return ""   // no chroma
+    }
+    lumaS := uint8( sc.mcuD.sComps[0].hSF )
+    lumaL := uint8( sc.mcuD.sComps[0].vSF )
+    chromaS := uint8( sc.mcuD.sComps[1].hSF )
+    chromaL := uint8( sc.mcuD.sComps[1].vSF )
+
+    if len( sc.mcuD.sComps ) == 3 &&
+        chromaS !=  uint8(sc.mcuD.sComps[2].hSF) &&
+        chromaL !=  uint8(sc.mcuD.sComps[2].vSF) {
+        return ""   // not representable
+    }
+    a := (chromaS * 4) / lumaS
+    b := a * ( ( ( chromaL * 2 ) / lumaL ) - 1 )
+    return fmt.Sprintf( "4:%d:%d", a, b )
+}
+
+func makeCompString( comp string, h, v uint ) string {
+    var cs []byte = make( []byte, 64 )  // max 4 samples comp => 16 * 4
+    j := int(0)
+    for row := uint(0); row < v; row ++ {
+        for col := uint(0); col < h; col++ {
+            n := copy( cs[j:], comp )
+            j += n
+            cs[j] = byte(row + '0')
+            cs[j+1] = byte(col + '0')
+            j += 2
+        }
+    }
+    return string(cs[:j])
+}
+
+func mcuFormat( sc *scan ) string {
 
     nCmp := len( sc.mcuD.sComps )
     if nCmp != 3 && nCmp != 1 { panic("Unsupported MCU format\n") }
 
-    var mcuf []byte = make( []byte, 32 )  // assume max res for all comp
-    var cType1, cType2 byte
-
-    j := 0
-    for i, c := range( sc.mcuD.sComps ) {
-        switch i {
-        case 0:
-            cType1, cType2 = 'Y', 0
-        case 1:
-            cType1, cType2 = 'C', 'b'
-        case 2:
-            cType2 = 'r'
-        }
-        for row := uint(0); row < c.vSF; row ++ {
-            for col := uint(0); col < c.hSF; col++ {
-                mcuf[j] = cType1
-                if cType2 != 0 { mcuf[j+1] = cType2; j++ }
-                mcuf[j+1] = byte(row + '0')
-                mcuf[j+2] = byte(col + '0')
-                j += 3
-            }
-        }
+    luma := makeCompString( "Y", sc.mcuD.sComps[0].hSF, sc.mcuD.sComps[0].vSF )
+    var mcuf string
+    if nCmp == 3 {
+        chromaB := makeCompString( "Cb",
+                                sc.mcuD.sComps[1].hSF, sc.mcuD.sComps[1].vSF )
+        chromaR := makeCompString( "Cr",
+                                sc.mcuD.sComps[2].hSF, sc.mcuD.sComps[2].vSF )
+        mcuf = fmt.Sprintf( "%s%s%s", luma, chromaB, chromaR )
+    } else {
+        mcuf = luma
     }
-    return string(mcuf[:j])
+    return mcuf
 }
 
-func (jpg *JpegDesc) startOfFrame( marker uint, sLen uint ) error {
-    if jpg.Content {
-        fmt.Printf( "SOF%d\n", marker & 0x0f )
+const (
+    markerLengthSize = 4
+    fixedFrameHeaderSize = 8    // all sizes excluding marker, if any
+    frameComponentSpecSize = 3
+    fixedScanHeaderSize = 6
+    scanComponentSpecSize = 2
+    restartIntervalSize = 4
+    defineNumberOfLinesSize = 4
+    fixedCommentHeaderSize = 2
+)
+
+// -------------- Frames
+
+func (f *frame)entropyCoding( ) EntropyCoding {
+    return EntropyCoding(f.encoding / 8)
+}
+
+func (f *frame)encodingMode( ) EncodingMode {
+    return EncodingMode(f.encoding % 4)
+}
+
+func (f *frame)samplePrecision( ) uint {
+    return uint(f.resolution.samplePrecision)
+}
+
+func (f *frame)nSamplesLine( ) uint {
+    return uint(f.resolution.nSamplesLine)
+}
+
+func (f *frame)nLines( ) uint {
+    return uint(f.resolution.nLines)
+}
+
+func (f *frame)serialize( w io.Writer ) (int, error) {
+
+    lf := uint16((len(f.components) * frameComponentSpecSize) + fixedFrameHeaderSize)
+    seg := make( []byte, lf + 2 )
+    binary.BigEndian.PutUint16( seg[0:], uint16(f.encoding)+_SOF0 )
+    binary.BigEndian.PutUint16( seg[2:], lf )
+    seg[4] = byte(f.resolution.samplePrecision)
+    var nLines uint16
+    if f.resolution.scanLines != 0 {
+        nLines = f.resolution.scanLines
+    } else if f.resolution.dnlLines != 0 {
+        nLines = f.resolution.dnlLines
+    } else {
+        nLines = f.resolution.nLines
     }
-    if jpg.state != _FRAME {
+    binary.BigEndian.PutUint16( seg[5:], nLines )
+    binary.BigEndian.PutUint16( seg[7:], f.resolution.nSamplesLine )
+    seg[9] = byte(len(f.components))
+
+    i := 10
+    for _, c := range f.components {
+        seg[i] = byte(c.Id)
+        seg[i+1] = byte( (c.HSF << 4) + c.VSF )
+        seg[i+2] = byte(c.QS)
+        i += 3
+    }
+    return w.Write( seg )
+}
+
+func (f *frame)format( w io.Writer ) (n int, err error) {
+    cw := newCumulativeWriter( w )
+    cw.format( "  Frame Encoding: %s\n", encodingString(f.encoding) )
+    cw.format( "    Entropy Coding: %s\n", entropyCodingString(f.entropyCoding()) )
+    cw.format( "    Encoding Mode: %s\n", encodingModeString(f.encodingMode()) )
+    nSamples := f.resolution.nSamplesLine
+    cw.format( "    Lines: %d, Samples/Line: %d," +
+               " sample precision: %d-bit, components: %d\n",
+               f.resolution.nLines, nSamples,
+               f.resolution.samplePrecision, len( f.components ) )
+    if ( nSamples % 8) != 0 {
+        cw.format( "    Warning: Samples/Line (%d) is not a multiple of 8\n",
+                   nSamples )
+    }
+    nMCUsLine := uint16(f.image.nMcuRST)
+    if nMCUsLine != 00 && (nSamples % nMCUsLine) != 0 {
+        cw.format( "    Warning: Samples/Line (%d) is not a " +
+                   "multiple of the restart interval (%d)\n", nSamples, nMCUsLine )
+    }
+
+    for i, c := range f.components {
+        cw.format( "      Component #%d Id %d Sampling factors"+
+                   " H:V=%d:%d, Quantization selector %d\n",
+                   i, c.Id, c.HSF, c.VSF, c.QS )
+    }
+    n, err = cw.result()
+    if err != nil { err = fmt.Errorf( "format: %w", err ) }
+    return
+}
+
+func (jpg *Desc) startOfFrame( marker uint, sLen uint ) error {
+
+    if jpg.state != _FRAME && jpg.state != _APPLICATION {
         return fmt.Errorf( "startOfFrame: Wrong sequence %s in state %s\n",
                            getJPEGmarkerName(marker), jpg.getJPEGStateName() )
     }
-    if sLen < 8 {
+    if sLen < fixedFrameHeaderSize {
         return fmt.Errorf( "startOfFrame: Wrong SOF%d header (len %d)\n", marker & 0x0f, sLen )
     }
-
-    offset := jpg.offset + 4
+    offset := jpg.offset + markerLengthSize
     nComponents := uint(jpg.data[offset+5])
-    if sLen < 8 + (nComponents * 3) {
+    if sLen < fixedFrameHeaderSize + (nComponents * frameComponentSpecSize) {
         return fmt.Errorf( "startOfFrame: Wrong SOF%d header (len %d for %d components)\n",
                            marker & 0x0f, sLen, nComponents )
     }
-    samplePrecision := uint(jpg.data[offset])
-    nLines := uint(jpg.data[offset+1]) << 8 + uint(jpg.data[offset+2])
-    nSamples := uint(jpg.data[offset+3]) << 8 + uint(jpg.data[offset+4])
+
+    jpg.frames = append( jpg.frames,
+                         frame {
+                           id: uint(len(jpg.frames)),
+                           encoding: Encoding(marker & 0x0f),
+                           resolution: sampling{
+                                samplePrecision: jpg.data[offset],
+                                nLines:       uint16(jpg.data[offset+1]) << 8 +
+                                              uint16(jpg.data[offset+2]),
+                                nSamplesLine: uint16(jpg.data[offset+3]) << 8 +
+                                              uint16(jpg.data[offset+4]) },
+                           image: jpg } )
+    frm := &jpg.frames[len(jpg.frames)-1]
     offset += 6
 
-    if jpg.Content {
-        if (nSamples % 8) != 0 {
-            fmt.Printf("  Warning: Samples/Line (%d) is not a multiple of 8\n", nSamples )
-        }
-        fmt.Printf( "  Lines: %d, Samples/Line: %d, sample precision: %d components: %d\n",
-                    nLines, nSamples, samplePrecision, nComponents )
-    }
-
-    var maxHSF, maxVSF uint
+    var maxHSF, maxVSF uint8
     for i := uint(0); i < nComponents; i++ {
-        cId := uint(jpg.data[offset])
-        hSF := uint(jpg.data[offset+1])
+        cId := jpg.data[offset]
+        hSF := jpg.data[offset+1]
         vSF := hSF & 0x0f
         hSF >>= 4
-        QS := uint(jpg.data[offset+2])
+        QS := jpg.data[offset+2]
 
         if hSF > maxHSF { maxHSF = hSF }
         if vSF > maxVSF { maxVSF = vSF }
-        jpg.components = append( jpg.components, component{ cId, hSF, vSF, QS } )
-        if jpg.Content {
-            fmt.Printf( "    Component #%d Id %d Sampling factors H:V=%d:%d, Quantization selector %d\n",
-                        i, cId, hSF, vSF, QS )
-        }
-        offset += 3
+        frm.components = append( frm.components, Component{ cId, hSF, vSF, QS } )
+        offset += frameComponentSpecSize
     }
 
-    jpg.resolution.samplePrecision = samplePrecision
-    jpg.resolution.nLines = nLines
-    jpg.resolution.nSamplesLine = nSamples
-    jpg.resolution.mhSF = maxHSF
-    jpg.resolution.mvSF = maxVSF
+    frm.resolution.mhSF = maxHSF
+    frm.resolution.mvSF = maxVSF
 
-    err := jpg.addTable( marker, jpg.offset, jpg.offset + 2 + sLen, original )
-    jpg.scans = append( jpg.scans, scan{ } )    // ready for the first scan (yet unknown)
+    frm.scans = append( frm.scans, scan{ } )    // ready for the first scan (yet unknown)
     jpg.state = _SCAN1
-    if err != nil { return jpgForwardError( "startOfFrame", err ) }
+
+    jpg.addSeg( frm )
     return nil
 }
 
-func (jpg *JpegDesc) processScanHeader( sLen uint ) error {
+// ----------- Scans
 
-    offset := jpg.offset + 4
+func (s *scan)serialize( w io.Writer ) (int, error) {
+
+    ls := uint16((len(s.mcuD.sComps) * scanComponentSpecSize) + fixedScanHeaderSize)
+    seg := make( []byte, ls + 2 )
+    binary.BigEndian.PutUint16( seg, _SOS )
+    binary.BigEndian.PutUint16( seg[2:], ls )
+    seg[4] = byte(len(s.mcuD.sComps))
+
+    i := 5
+    for _, c := range s.mcuD.sComps {
+        seg[i] = c.cId
+        seg[i+1] = c.dcId << 4 + c.acId
+        i += 2
+    }
+    seg[i] = s.startSS
+    seg[i+1] = s.endSS
+    seg[i+2] = s.sABPh << 4 + s.sABPl
+
+    n, err := w.Write( seg )
+    if err != nil {
+        return n, err
+    }
+    // _SOS segment is followed by actual entropy coded segments
+    nb, err := w.Write( s.ECSs )
+    if err == nil {
+        n += nb
+    }
+    return n, err
+}
+
+var compNames = [...]string{ " Y", "Cb", "Cr" }
+
+func (s *scan)formatMCUs( cw *cumulativeWriter, m FormatMode ) {
+
+    nComponents := len(s.mcuD.sComps)
+    cw.format( "    %d Components:\n", nComponents )
+    for i, c := range s.mcuD.sComps {
+        cw.format( "      %s Selector 0x%x, Sampling factors H:%d V:%d\n",
+                    compNames[i], c.cId, c.hSF, c.vSF )
+
+        cw.format( "         Tables entropy DC:%d AC:%d," +
+                   " quantization:%d precision %d-bit\n",
+                   c.dcId, c.acId, c.quId, c.quSz )
+        if m == Extra || m == Both {
+            cw.format( "         %d Data Units, %d iDCT matrices\n",
+                       len(c.dUnits), len(c.iDCTdata) )
+        }
+    }
+    if m == Extra || m == Both {
+        cw.format( "    Spectral selection Start:%d, End:%d\n",
+                   s.startSS, s.endSS )
+        cw.format( "    Successive approximation bit position, high:%d low:%d\n",
+                    s.sABPh, s.sABPl )
+
+        subsampling := subsamplingFormat( s )
+        mcuFormat := mcuFormat( s )
+
+        var comString string
+        if nComponents == 3 {
+            comString = "Interleaved"
+        } else {
+            comString = "Grayscale Y"
+        }
+        cw.format( "    Subsampling %s - %s MCU format %s\n",
+                   subsampling, comString, mcuFormat )
+    }
+    cw.format( "    Total %d MCUs in scan\n", s.nMcus )
+    if s.rstInterval > 0 {
+        cw.format( "    Restart interval every %d MCUs (%d restarts in scan)\n",
+                   s.rstInterval, s.rstCount )
+        cw.format( "    %d Entropy-coded segments (ECS) in scan\n", s.rstCount + 1)
+    } else {
+        cw.format( "    1 Entropy-coded segment (ECS) in scan\n" )
+    }
+}
+
+func (s *scan)formatAt( cw *cumulativeWriter, index int, mode FormatMode ) {
+    cw.format( "  Scan #%d:\n", index )
+    s.formatMCUs( cw, mode )
+}
+
+func (s *scan)format( w io.Writer ) (n int, err error) {
+    cw := newCumulativeWriter( w )
+    cw.format( "  Scan:\n" )
+    s.formatMCUs( cw, Standard )
+    n, err = cw.result()
+    if err != nil { err = fmt.Errorf( "format: %w", err ) }
+    return
+}
+
+func (jpg *Desc) processScanHeader( sLen uint ) (*scan, error) {
+
+    offset := jpg.offset + markerLengthSize
     nComponents := uint(jpg.data[offset])
 
     offset += 1
-    if sLen != 6 + nComponents * 2 {
-        return fmt.Errorf( "processScanHeader: Wrong SOS header (len %d for %d components)\n",
-                           sLen, nComponents )
+    if sLen != fixedScanHeaderSize + nComponents * scanComponentSpecSize {
+        return nil, fmt.Errorf(
+            "processScanHeader: Wrong SOS header (len %d for %d components)\n",
+            sLen, nComponents )
     }
 
-    sCs := make( []scanCompRef, int(nComponents) )
+    sCs := make( []scanCompRef, nComponents )
     for i := uint(0); i < nComponents; i++ {
-        sCs[i].CMId = uint(jpg.data[offset])
-        eCTS := uint(jpg.data[offset+1])
-        sCs[i].DCId = eCTS >> 4
-        sCs[i].ACId = eCTS & 0x0f
-        offset += 2
+        sCs[i].cmId = jpg.data[offset]
+        eIDs := jpg.data[offset+1]
+        sCs[i].dcId = eIDs >> 4
+        sCs[i].acId = eIDs & 0x0f
+        offset += scanComponentSpecSize
     }
 
     scan := jpg.getCurrentScan()
-    if scan == nil { panic("Internal error (no frame for scan)\n") }
-    scan.mcuD = jpg.getMcuDesc( &sCs )
+    if scan == nil { panic("processScanHeader: scan not allocated\n") }
+    scan.rstInterval = jpg.nMcuRST
+    scan.mcuD = jpg.newMcuDesc( &sCs )
 
-    if jpg.Content {
-        startSS := jpg.data[offset]
-        endSS := jpg.data[offset+1]
-        ssABP := jpg.data[offset+2]
+    scan.startSS = jpg.data[offset]
+    scan.endSS = jpg.data[offset+1]
+    sABP := jpg.data[offset+2]
+    scan.sABPh = sABP >> 4
+    scan.sABPl = sABP & 0x0f
 
-        fmt.Printf( "  Components: %d\n", nComponents )
-        for _, sC := range sCs {
-            fmt.Printf( "    Selector 0x%x, DC entropy coding 0x%x, AC entropy coding 0x%x\n",
-                        sC.CMId, sC.DCId, sC.ACId )
-        }
-        fmt.Printf( "  Spectral selection Start 0x%x, End 0x%x\n", startSS, endSS )
-        fmt.Printf( "  Successive approximation bit position, high 0x%x low 0x%x\n", ssABP >> 4, ssABP & 0x0f )
-        mcuFormat := getMcuFormat( scan )
-
-        if nComponents == 3 {
-            fmt.Printf( "  Interleaved YCbCr" )
-        } else {
-            fmt.Printf( "  Grayscale Y" )
-        }
-        fmt.Printf( ": MCUs format %s\n", mcuFormat )
-    }
-    return nil
+    return scan, nil
 }
 
-var rlCodes = [][]int{
-   { 0 },
-   { -1,  1 },
-   { -3, -2,  2,  3 },
-   { -7, -6, -5, -4,  4,  5,  6,  7 },
-   { -15, -14, -13, -12, -11, -10, -9, -8,
-      8,  9,  10,  11,  12,  13,  14,  15 },
-   { -31, -30, -29, -28, -27, -26, -25, -24,
-     -23, -22, -21, -20, -19, -18, -17, -16,
-      16,  17,  18,  19,  20,  21,  22,  23,
-      24,  25,  26,  27,  28,  29,  30,  31 },
-   { -63, -62, -61, -60, -59, -58, -57, -56,
-     -55, -54, -53, -52, -51, -50, -49, -48,
-     -47, -46, -45, -44, -43, -42, -41, -40,
-     -39, -38, -37, -36, -35, -34, -33, -32,
-      32,  33,  34,  35,  36,  37,  38,  39,
-      40,  41,  42,  43,  44,  45,  46,  47,
-      48,  49,  50,  51,  52,  53,  54,  55,
-      56,  57,  58,  59,  60,  61,  62,  63 },
-   { -127, -126, -125, -124, -123, -122, -121, -120,
-     -119, -118, -117, -116, -115, -114, -113, -112,
-     -111, -110, -109, -108, -107, -106, -105, -104,
-     -103, -102, -101, -100, -99, -98, -97, -96,
-     -95, -94, -93, -92, -91, -90, -89, -88,
-     -87, -86, -85, -84, -83, -82, -81, -80,
-     -79, -78, -77, -76, -75, -74, -73, -72,
-     -71, -70, -69, -68, -67, -66, -65, -64,
-      64,  65,  66,  67,  68,  69,  70,  71,
-      72,  73,  74,  75,  76,  77,  78,  79,
-      80,  81,  82,  83,  84,  85,  86,  87,
-      88,  89,  90,  91,  92,  93,  94,  95,
-      96,  97,  98,  99,  100,  101,  102,  103,
-      104,  105,  106,  107,  108,  109,  110,  111,
-      112,  113,  114,  115,  116,  117,  118,  119,
-      120,  121,  122,  123,  124,  125,  126,  127 },
-   { -255, -254, -253, -252, -251, -250, -249, -248,
-     -247, -246, -245, -244, -243, -242, -241, -240,
-     -239, -238, -237, -236, -235, -234, -233, -232,
-     -231, -230, -229, -228, -227, -226, -225, -224,
-     -223, -222, -221, -220, -219, -218, -217, -216,
-     -215, -214, -213, -212, -211, -210, -209, -208,
-     -207, -206, -205, -204, -203, -202, -201, -200,
-     -199, -198, -197, -196, -195, -194, -193, -192,
-     -191, -190, -189, -188, -187, -186, -185, -184,
-     -183, -182, -181, -180, -179, -178, -177, -176,
-     -175, -174, -173, -172, -171, -170, -169, -168,
-     -167, -166, -165, -164, -163, -162, -161, -160,
-     -159, -158, -157, -156, -155, -154, -153, -152,
-     -151, -150, -149, -148, -147, -146, -145, -144,
-     -143, -142, -141, -140, -139, -138, -137, -136,
-     -135, -134, -133, -132, -131, -130, -129, -128,
-      128,  129,  130,  131,  132,  133,  134,  135,
-      136,  137,  138,  139,  140,  141,  142,  143,
-      144,  145,  146,  147,  148,  149,  150,  151,
-      152,  153,  154,  155,  156,  157,  158,  159,
-      160,  161,  162,  163,  164,  165,  166,  167,
-      168,  169,  170,  171,  172,  173,  174,  175,
-      176,  177,  178,  179,  180,  181,  182,  183,
-      184,  185,  186,  187,  188,  189,  190,  191,
-      192,  193,  194,  195,  196,  197,  198,  199,
-      200,  201,  202,  203,  204,  205,  206,  207,
-      208,  209,  210,  211,  212,  213,  214,  215,
-      216,  217,  218,  219,  220,  221,  222,  223,
-      224,  225,  226,  227,  228,  229,  230,  231,
-      232,  233,  234,  235,  236,  237,  238,  239,
-      240,  241,  242,  243,  244,  245,  246,  247,
-      248,  249,  250,  251,  252,  253,  254,  255 },
-   { -511, -510, -509, -508, -507, -506, -505, -504,
-     -503, -502, -501, -500, -499, -498, -497, -496,
-     -495, -494, -493, -492, -491, -490, -489, -488,
-     -487, -486, -485, -484, -483, -482, -481, -480,
-     -479, -478, -477, -476, -475, -474, -473, -472,
-     -471, -470, -469, -468, -467, -466, -465, -464,
-     -463, -462, -461, -460, -459, -458, -457, -456,
-     -455, -454, -453, -452, -451, -450, -449, -448,
-     -447, -446, -445, -444, -443, -442, -441, -440,
-     -439, -438, -437, -436, -435, -434, -433, -432,
-     -431, -430, -429, -428, -427, -426, -425, -424,
-     -423, -422, -421, -420, -419, -418, -417, -416,
-     -415, -414, -413, -412, -411, -410, -409, -408,
-     -407, -406, -405, -404, -403, -402, -401, -400,
-     -399, -398, -397, -396, -395, -394, -393, -392,
-     -391, -390, -389, -388, -387, -386, -385, -384,
-     -383, -382, -381, -380, -379, -378, -377, -376,
-     -375, -374, -373, -372, -371, -370, -369, -368,
-     -367, -366, -365, -364, -363, -362, -361, -360,
-     -359, -358, -357, -356, -355, -354, -353, -352,
-     -351, -350, -349, -348, -347, -346, -345, -344,
-     -343, -342, -341, -340, -339, -338, -337, -336,
-     -335, -334, -333, -332, -331, -330, -329, -328,
-     -327, -326, -325, -324, -323, -322, -321, -320,
-     -319, -318, -317, -316, -315, -314, -313, -312,
-     -311, -310, -309, -308, -307, -306, -305, -304,
-     -303, -302, -301, -300, -299, -298, -297, -296,
-     -295, -294, -293, -292, -291, -290, -289, -288,
-     -287, -286, -285, -284, -283, -282, -281, -280,
-     -279, -278, -277, -276, -275, -274, -273, -272,
-     -271, -270, -269, -268, -267, -266, -265, -264,
-     -263, -262, -261, -260, -259, -258, -257, -256,
-      256,  257,  258,  259,  260,  261,  262,  263,
-      264,  265,  266,  267,  268,  269,  270,  271,
-      272,  273,  274,  275,  276,  277,  278,  279,
-      280,  281,  282,  283,  284,  285,  286,  287,
-      288,  289,  290,  291,  292,  293,  294,  295,
-      296,  297,  298,  299,  300,  301,  302,  303,
-      304,  305,  306,  307,  308,  309,  310,  311,
-      312,  313,  314,  315,  316,  317,  318,  319,
-      320,  321,  322,  323,  324,  325,  326,  327,
-      328,  329,  330,  331,  332,  333,  334,  335,
-      336,  337,  338,  339,  340,  341,  342,  343,
-      344,  345,  346,  347,  348,  349,  350,  351,
-      352,  353,  354,  355,  356,  357,  358,  359,
-      360,  361,  362,  363,  364,  365,  366,  367,
-      368,  369,  370,  371,  372,  373,  374,  375,
-      376,  377,  378,  379,  380,  381,  382,  383,
-      384,  385,  386,  387,  388,  389,  390,  391,
-      392,  393,  394,  395,  396,  397,  398,  399,
-      400,  401,  402,  403,  404,  405,  406,  407,
-      408,  409,  410,  411,  412,  413,  414,  415,
-      416,  417,  418,  419,  420,  421,  422,  423,
-      424,  425,  426,  427,  428,  429,  430,  431,
-      432,  433,  434,  435,  436,  437,  438,  439,
-      440,  441,  442,  443,  444,  445,  446,  447,
-      448,  449,  450,  451,  452,  453,  454,  455,
-      456,  457,  458,  459,  460,  461,  462,  463,
-      464,  465,  466,  467,  468,  469,  470,  471,
-      472,  473,  474,  475,  476,  477,  478,  479,
-      480,  481,  482,  483,  484,  485,  486,  487,
-      488,  489,  490,  491,  492,  493,  494,  495,
-      496,  497,  498,  499,  500,  501,  502,  503,
-      504,  505,  506,  507,  508,  509,  510,  511 },
-   { -1023, -1022, -1021, -1020, -1019, -1018, -1017, -1016,
-     -1015, -1014, -1013, -1012, -1011, -1010, -1009, -1008,
-     -1007, -1006, -1005, -1004, -1003, -1002, -1001, -1000,
-     -999, -998, -997, -996, -995, -994, -993, -992,
-     -991, -990, -989, -988, -987, -986, -985, -984,
-     -983, -982, -981, -980, -979, -978, -977, -976,
-     -975, -974, -973, -972, -971, -970, -969, -968,
-     -967, -966, -965, -964, -963, -962, -961, -960,
-     -959, -958, -957, -956, -955, -954, -953, -952,
-     -951, -950, -949, -948, -947, -946, -945, -944,
-     -943, -942, -941, -940, -939, -938, -937, -936,
-     -935, -934, -933, -932, -931, -930, -929, -928,
-     -927, -926, -925, -924, -923, -922, -921, -920,
-     -919, -918, -917, -916, -915, -914, -913, -912,
-     -911, -910, -909, -908, -907, -906, -905, -904,
-     -903, -902, -901, -900, -899, -898, -897, -896,
-     -895, -894, -893, -892, -891, -890, -889, -888,
-     -887, -886, -885, -884, -883, -882, -881, -880,
-     -879, -878, -877, -876, -875, -874, -873, -872,
-     -871, -870, -869, -868, -867, -866, -865, -864,
-     -863, -862, -861, -860, -859, -858, -857, -856,
-     -855, -854, -853, -852, -851, -850, -849, -848,
-     -847, -846, -845, -844, -843, -842, -841, -840,
-     -839, -838, -837, -836, -835, -834, -833, -832,
-     -831, -830, -829, -828, -827, -826, -825, -824,
-     -823, -822, -821, -820, -819, -818, -817, -816,
-     -815, -814, -813, -812, -811, -810, -809, -808,
-     -807, -806, -805, -804, -803, -802, -801, -800,
-     -799, -798, -797, -796, -795, -794, -793, -792,
-     -791, -790, -789, -788, -787, -786, -785, -784,
-     -783, -782, -781, -780, -779, -778, -777, -776,
-     -775, -774, -773, -772, -771, -770, -769, -768,
-     -767, -766, -765, -764, -763, -762, -761, -760,
-     -759, -758, -757, -756, -755, -754, -753, -752,
-     -751, -750, -749, -748, -747, -746, -745, -744,
-     -743, -742, -741, -740, -739, -738, -737, -736,
-     -735, -734, -733, -732, -731, -730, -729, -728,
-     -727, -726, -725, -724, -723, -722, -721, -720,
-     -719, -718, -717, -716, -715, -714, -713, -712,
-     -711, -710, -709, -708, -707, -706, -705, -704,
-     -703, -702, -701, -700, -699, -698, -697, -696,
-     -695, -694, -693, -692, -691, -690, -689, -688,
-     -687, -686, -685, -684, -683, -682, -681, -680,
-     -679, -678, -677, -676, -675, -674, -673, -672,
-     -671, -670, -669, -668, -667, -666, -665, -664,
-     -663, -662, -661, -660, -659, -658, -657, -656,
-     -655, -654, -653, -652, -651, -650, -649, -648,
-     -647, -646, -645, -644, -643, -642, -641, -640,
-     -639, -638, -637, -636, -635, -634, -633, -632,
-     -631, -630, -629, -628, -627, -626, -625, -624,
-     -623, -622, -621, -620, -619, -618, -617, -616,
-     -615, -614, -613, -612, -611, -610, -609, -608,
-     -607, -606, -605, -604, -603, -602, -601, -600,
-     -599, -598, -597, -596, -595, -594, -593, -592,
-     -591, -590, -589, -588, -587, -586, -585, -584,
-     -583, -582, -581, -580, -579, -578, -577, -576,
-     -575, -574, -573, -572, -571, -570, -569, -568,
-     -567, -566, -565, -564, -563, -562, -561, -560,
-     -559, -558, -557, -556, -555, -554, -553, -552,
-     -551, -550, -549, -548, -547, -546, -545, -544,
-     -543, -542, -541, -540, -539, -538, -537, -536,
-     -535, -534, -533, -532, -531, -530, -529, -528,
-     -527, -526, -525, -524, -523, -522, -521, -520,
-     -519, -518, -517, -516, -515, -514, -513, -512,
-      512,  513,  514,  515,  516,  517,  518,  519,
-      520,  521,  522,  523,  524,  525,  526,  527,
-      528,  529,  530,  531,  532,  533,  534,  535,
-      536,  537,  538,  539,  540,  541,  542,  543,
-      544,  545,  546,  547,  548,  549,  550,  551,
-      552,  553,  554,  555,  556,  557,  558,  559,
-      560,  561,  562,  563,  564,  565,  566,  567,
-      568,  569,  570,  571,  572,  573,  574,  575,
-      576,  577,  578,  579,  580,  581,  582,  583,
-      584,  585,  586,  587,  588,  589,  590,  591,
-      592,  593,  594,  595,  596,  597,  598,  599,
-      600,  601,  602,  603,  604,  605,  606,  607,
-      608,  609,  610,  611,  612,  613,  614,  615,
-      616,  617,  618,  619,  620,  621,  622,  623,
-      624,  625,  626,  627,  628,  629,  630,  631,
-      632,  633,  634,  635,  636,  637,  638,  639,
-      640,  641,  642,  643,  644,  645,  646,  647,
-      648,  649,  650,  651,  652,  653,  654,  655,
-      656,  657,  658,  659,  660,  661,  662,  663,
-      664,  665,  666,  667,  668,  669,  670,  671,
-      672,  673,  674,  675,  676,  677,  678,  679,
-      680,  681,  682,  683,  684,  685,  686,  687,
-      688,  689,  690,  691,  692,  693,  694,  695,
-      696,  697,  698,  699,  700,  701,  702,  703,
-      704,  705,  706,  707,  708,  709,  710,  711,
-      712,  713,  714,  715,  716,  717,  718,  719,
-      720,  721,  722,  723,  724,  725,  726,  727,
-      728,  729,  730,  731,  732,  733,  734,  735,
-      736,  737,  738,  739,  740,  741,  742,  743,
-      744,  745,  746,  747,  748,  749,  750,  751,
-      752,  753,  754,  755,  756,  757,  758,  759,
-      760,  761,  762,  763,  764,  765,  766,  767,
-      768,  769,  770,  771,  772,  773,  774,  775,
-      776,  777,  778,  779,  780,  781,  782,  783,
-      784,  785,  786,  787,  788,  789,  790,  791,
-      792,  793,  794,  795,  796,  797,  798,  799,
-      800,  801,  802,  803,  804,  805,  806,  807,
-      808,  809,  810,  811,  812,  813,  814,  815,
-      816,  817,  818,  819,  820,  821,  822,  823,
-      824,  825,  826,  827,  828,  829,  830,  831,
-      832,  833,  834,  835,  836,  837,  838,  839,
-      840,  841,  842,  843,  844,  845,  846,  847,
-      848,  849,  850,  851,  852,  853,  854,  855,
-      856,  857,  858,  859,  860,  861,  862,  863,
-      864,  865,  866,  867,  868,  869,  870,  871,
-      872,  873,  874,  875,  876,  877,  878,  879,
-      880,  881,  882,  883,  884,  885,  886,  887,
-      888,  889,  890,  891,  892,  893,  894,  895,
-      896,  897,  898,  899,  900,  901,  902,  903,
-      904,  905,  906,  907,  908,  909,  910,  911,
-      912,  913,  914,  915,  916,  917,  918,  919,
-      920,  921,  922,  923,  924,  925,  926,  927,
-      928,  929,  930,  931,  932,  933,  934,  935,
-      936,  937,  938,  939,  940,  941,  942,  943,
-      944,  945,  946,  947,  948,  949,  950,  951,
-      952,  953,  954,  955,  956,  957,  958,  959,
-      960,  961,  962,  963,  964,  965,  966,  967,
-      968,  969,  970,  971,  972,  973,  974,  975,
-      976,  977,  978,  979,  980,  981,  982,  983,
-      984,  985,  986,  987,  988,  989,  990,  991,
-      992,  993,  994,  995,  996,  997,  998,  999,
-      1000,  1001,  1002,  1003,  1004,  1005,  1006,  1007,
-      1008,  1009,  1010,  1011,  1012,  1013,  1014,  1015,
-      1016,  1017,  1018,  1019,  1020,  1021,  1022,  1023 },
-   { -2047, -2046, -2045, -2044, -2043, -2042, -2041, -2040,
-     -2039, -2038, -2037, -2036, -2035, -2034, -2033, -2032,
-     -2031, -2030, -2029, -2028, -2027, -2026, -2025, -2024,
-     -2023, -2022, -2021, -2020, -2019, -2018, -2017, -2016,
-     -2015, -2014, -2013, -2012, -2011, -2010, -2009, -2008,
-     -2007, -2006, -2005, -2004, -2003, -2002, -2001, -2000,
-     -1999, -1998, -1997, -1996, -1995, -1994, -1993, -1992,
-     -1991, -1990, -1989, -1988, -1987, -1986, -1985, -1984,
-     -1983, -1982, -1981, -1980, -1979, -1978, -1977, -1976,
-     -1975, -1974, -1973, -1972, -1971, -1970, -1969, -1968,
-     -1967, -1966, -1965, -1964, -1963, -1962, -1961, -1960,
-     -1959, -1958, -1957, -1956, -1955, -1954, -1953, -1952,
-     -1951, -1950, -1949, -1948, -1947, -1946, -1945, -1944,
-     -1943, -1942, -1941, -1940, -1939, -1938, -1937, -1936,
-     -1935, -1934, -1933, -1932, -1931, -1930, -1929, -1928,
-     -1927, -1926, -1925, -1924, -1923, -1922, -1921, -1920,
-     -1919, -1918, -1917, -1916, -1915, -1914, -1913, -1912,
-     -1911, -1910, -1909, -1908, -1907, -1906, -1905, -1904,
-     -1903, -1902, -1901, -1900, -1899, -1898, -1897, -1896,
-     -1895, -1894, -1893, -1892, -1891, -1890, -1889, -1888,
-     -1887, -1886, -1885, -1884, -1883, -1882, -1881, -1880,
-     -1879, -1878, -1877, -1876, -1875, -1874, -1873, -1872,
-     -1871, -1870, -1869, -1868, -1867, -1866, -1865, -1864,
-     -1863, -1862, -1861, -1860, -1859, -1858, -1857, -1856,
-     -1855, -1854, -1853, -1852, -1851, -1850, -1849, -1848,
-     -1847, -1846, -1845, -1844, -1843, -1842, -1841, -1840,
-     -1839, -1838, -1837, -1836, -1835, -1834, -1833, -1832,
-     -1831, -1830, -1829, -1828, -1827, -1826, -1825, -1824,
-     -1823, -1822, -1821, -1820, -1819, -1818, -1817, -1816,
-     -1815, -1814, -1813, -1812, -1811, -1810, -1809, -1808,
-     -1807, -1806, -1805, -1804, -1803, -1802, -1801, -1800,
-     -1799, -1798, -1797, -1796, -1795, -1794, -1793, -1792,
-     -1791, -1790, -1789, -1788, -1787, -1786, -1785, -1784,
-     -1783, -1782, -1781, -1780, -1779, -1778, -1777, -1776,
-     -1775, -1774, -1773, -1772, -1771, -1770, -1769, -1768,
-     -1767, -1766, -1765, -1764, -1763, -1762, -1761, -1760,
-     -1759, -1758, -1757, -1756, -1755, -1754, -1753, -1752,
-     -1751, -1750, -1749, -1748, -1747, -1746, -1745, -1744,
-     -1743, -1742, -1741, -1740, -1739, -1738, -1737, -1736,
-     -1735, -1734, -1733, -1732, -1731, -1730, -1729, -1728,
-     -1727, -1726, -1725, -1724, -1723, -1722, -1721, -1720,
-     -1719, -1718, -1717, -1716, -1715, -1714, -1713, -1712,
-     -1711, -1710, -1709, -1708, -1707, -1706, -1705, -1704,
-     -1703, -1702, -1701, -1700, -1699, -1698, -1697, -1696,
-     -1695, -1694, -1693, -1692, -1691, -1690, -1689, -1688,
-     -1687, -1686, -1685, -1684, -1683, -1682, -1681, -1680,
-     -1679, -1678, -1677, -1676, -1675, -1674, -1673, -1672,
-     -1671, -1670, -1669, -1668, -1667, -1666, -1665, -1664,
-     -1663, -1662, -1661, -1660, -1659, -1658, -1657, -1656,
-     -1655, -1654, -1653, -1652, -1651, -1650, -1649, -1648,
-     -1647, -1646, -1645, -1644, -1643, -1642, -1641, -1640,
-     -1639, -1638, -1637, -1636, -1635, -1634, -1633, -1632,
-     -1631, -1630, -1629, -1628, -1627, -1626, -1625, -1624,
-     -1623, -1622, -1621, -1620, -1619, -1618, -1617, -1616,
-     -1615, -1614, -1613, -1612, -1611, -1610, -1609, -1608,
-     -1607, -1606, -1605, -1604, -1603, -1602, -1601, -1600,
-     -1599, -1598, -1597, -1596, -1595, -1594, -1593, -1592,
-     -1591, -1590, -1589, -1588, -1587, -1586, -1585, -1584,
-     -1583, -1582, -1581, -1580, -1579, -1578, -1577, -1576,
-     -1575, -1574, -1573, -1572, -1571, -1570, -1569, -1568,
-     -1567, -1566, -1565, -1564, -1563, -1562, -1561, -1560,
-     -1559, -1558, -1557, -1556, -1555, -1554, -1553, -1552,
-     -1551, -1550, -1549, -1548, -1547, -1546, -1545, -1544,
-     -1543, -1542, -1541, -1540, -1539, -1538, -1537, -1536,
-     -1535, -1534, -1533, -1532, -1531, -1530, -1529, -1528,
-     -1527, -1526, -1525, -1524, -1523, -1522, -1521, -1520,
-     -1519, -1518, -1517, -1516, -1515, -1514, -1513, -1512,
-     -1511, -1510, -1509, -1508, -1507, -1506, -1505, -1504,
-     -1503, -1502, -1501, -1500, -1499, -1498, -1497, -1496,
-     -1495, -1494, -1493, -1492, -1491, -1490, -1489, -1488,
-     -1487, -1486, -1485, -1484, -1483, -1482, -1481, -1480,
-     -1479, -1478, -1477, -1476, -1475, -1474, -1473, -1472,
-     -1471, -1470, -1469, -1468, -1467, -1466, -1465, -1464,
-     -1463, -1462, -1461, -1460, -1459, -1458, -1457, -1456,
-     -1455, -1454, -1453, -1452, -1451, -1450, -1449, -1448,
-     -1447, -1446, -1445, -1444, -1443, -1442, -1441, -1440,
-     -1439, -1438, -1437, -1436, -1435, -1434, -1433, -1432,
-     -1431, -1430, -1429, -1428, -1427, -1426, -1425, -1424,
-     -1423, -1422, -1421, -1420, -1419, -1418, -1417, -1416,
-     -1415, -1414, -1413, -1412, -1411, -1410, -1409, -1408,
-     -1407, -1406, -1405, -1404, -1403, -1402, -1401, -1400,
-     -1399, -1398, -1397, -1396, -1395, -1394, -1393, -1392,
-     -1391, -1390, -1389, -1388, -1387, -1386, -1385, -1384,
-     -1383, -1382, -1381, -1380, -1379, -1378, -1377, -1376,
-     -1375, -1374, -1373, -1372, -1371, -1370, -1369, -1368,
-     -1367, -1366, -1365, -1364, -1363, -1362, -1361, -1360,
-     -1359, -1358, -1357, -1356, -1355, -1354, -1353, -1352,
-     -1351, -1350, -1349, -1348, -1347, -1346, -1345, -1344,
-     -1343, -1342, -1341, -1340, -1339, -1338, -1337, -1336,
-     -1335, -1334, -1333, -1332, -1331, -1330, -1329, -1328,
-     -1327, -1326, -1325, -1324, -1323, -1322, -1321, -1320,
-     -1319, -1318, -1317, -1316, -1315, -1314, -1313, -1312,
-     -1311, -1310, -1309, -1308, -1307, -1306, -1305, -1304,
-     -1303, -1302, -1301, -1300, -1299, -1298, -1297, -1296,
-     -1295, -1294, -1293, -1292, -1291, -1290, -1289, -1288,
-     -1287, -1286, -1285, -1284, -1283, -1282, -1281, -1280,
-     -1279, -1278, -1277, -1276, -1275, -1274, -1273, -1272,
-     -1271, -1270, -1269, -1268, -1267, -1266, -1265, -1264,
-     -1263, -1262, -1261, -1260, -1259, -1258, -1257, -1256,
-     -1255, -1254, -1253, -1252, -1251, -1250, -1249, -1248,
-     -1247, -1246, -1245, -1244, -1243, -1242, -1241, -1240,
-     -1239, -1238, -1237, -1236, -1235, -1234, -1233, -1232,
-     -1231, -1230, -1229, -1228, -1227, -1226, -1225, -1224,
-     -1223, -1222, -1221, -1220, -1219, -1218, -1217, -1216,
-     -1215, -1214, -1213, -1212, -1211, -1210, -1209, -1208,
-     -1207, -1206, -1205, -1204, -1203, -1202, -1201, -1200,
-     -1199, -1198, -1197, -1196, -1195, -1194, -1193, -1192,
-     -1191, -1190, -1189, -1188, -1187, -1186, -1185, -1184,
-     -1183, -1182, -1181, -1180, -1179, -1178, -1177, -1176,
-     -1175, -1174, -1173, -1172, -1171, -1170, -1169, -1168,
-     -1167, -1166, -1165, -1164, -1163, -1162, -1161, -1160,
-     -1159, -1158, -1157, -1156, -1155, -1154, -1153, -1152,
-     -1151, -1150, -1149, -1148, -1147, -1146, -1145, -1144,
-     -1143, -1142, -1141, -1140, -1139, -1138, -1137, -1136,
-     -1135, -1134, -1133, -1132, -1131, -1130, -1129, -1128,
-     -1127, -1126, -1125, -1124, -1123, -1122, -1121, -1120,
-     -1119, -1118, -1117, -1116, -1115, -1114, -1113, -1112,
-     -1111, -1110, -1109, -1108, -1107, -1106, -1105, -1104,
-     -1103, -1102, -1101, -1100, -1099, -1098, -1097, -1096,
-     -1095, -1094, -1093, -1092, -1091, -1090, -1089, -1088,
-     -1087, -1086, -1085, -1084, -1083, -1082, -1081, -1080,
-     -1079, -1078, -1077, -1076, -1075, -1074, -1073, -1072,
-     -1071, -1070, -1069, -1068, -1067, -1066, -1065, -1064,
-     -1063, -1062, -1061, -1060, -1059, -1058, -1057, -1056,
-     -1055, -1054, -1053, -1052, -1051, -1050, -1049, -1048,
-     -1047, -1046, -1045, -1044, -1043, -1042, -1041, -1040,
-     -1039, -1038, -1037, -1036, -1035, -1034, -1033, -1032,
-     -1031, -1030, -1029, -1028, -1027, -1026, -1025, -1024,
-      1024,  1025,  1026,  1027,  1028,  1029,  1030,  1031,
-      1032,  1033,  1034,  1035,  1036,  1037,  1038,  1039,
-      1040,  1041,  1042,  1043,  1044,  1045,  1046,  1047,
-      1048,  1049,  1050,  1051,  1052,  1053,  1054,  1055,
-      1056,  1057,  1058,  1059,  1060,  1061,  1062,  1063,
-      1064,  1065,  1066,  1067,  1068,  1069,  1070,  1071,
-      1072,  1073,  1074,  1075,  1076,  1077,  1078,  1079,
-      1080,  1081,  1082,  1083,  1084,  1085,  1086,  1087,
-      1088,  1089,  1090,  1091,  1092,  1093,  1094,  1095,
-      1096,  1097,  1098,  1099,  1100,  1101,  1102,  1103,
-      1104,  1105,  1106,  1107,  1108,  1109,  1110,  1111,
-      1112,  1113,  1114,  1115,  1116,  1117,  1118,  1119,
-      1120,  1121,  1122,  1123,  1124,  1125,  1126,  1127,
-      1128,  1129,  1130,  1131,  1132,  1133,  1134,  1135,
-      1136,  1137,  1138,  1139,  1140,  1141,  1142,  1143,
-      1144,  1145,  1146,  1147,  1148,  1149,  1150,  1151,
-      1152,  1153,  1154,  1155,  1156,  1157,  1158,  1159,
-      1160,  1161,  1162,  1163,  1164,  1165,  1166,  1167,
-      1168,  1169,  1170,  1171,  1172,  1173,  1174,  1175,
-      1176,  1177,  1178,  1179,  1180,  1181,  1182,  1183,
-      1184,  1185,  1186,  1187,  1188,  1189,  1190,  1191,
-      1192,  1193,  1194,  1195,  1196,  1197,  1198,  1199,
-      1200,  1201,  1202,  1203,  1204,  1205,  1206,  1207,
-      1208,  1209,  1210,  1211,  1212,  1213,  1214,  1215,
-      1216,  1217,  1218,  1219,  1220,  1221,  1222,  1223,
-      1224,  1225,  1226,  1227,  1228,  1229,  1230,  1231,
-      1232,  1233,  1234,  1235,  1236,  1237,  1238,  1239,
-      1240,  1241,  1242,  1243,  1244,  1245,  1246,  1247,
-      1248,  1249,  1250,  1251,  1252,  1253,  1254,  1255,
-      1256,  1257,  1258,  1259,  1260,  1261,  1262,  1263,
-      1264,  1265,  1266,  1267,  1268,  1269,  1270,  1271,
-      1272,  1273,  1274,  1275,  1276,  1277,  1278,  1279,
-      1280,  1281,  1282,  1283,  1284,  1285,  1286,  1287,
-      1288,  1289,  1290,  1291,  1292,  1293,  1294,  1295,
-      1296,  1297,  1298,  1299,  1300,  1301,  1302,  1303,
-      1304,  1305,  1306,  1307,  1308,  1309,  1310,  1311,
-      1312,  1313,  1314,  1315,  1316,  1317,  1318,  1319,
-      1320,  1321,  1322,  1323,  1324,  1325,  1326,  1327,
-      1328,  1329,  1330,  1331,  1332,  1333,  1334,  1335,
-      1336,  1337,  1338,  1339,  1340,  1341,  1342,  1343,
-      1344,  1345,  1346,  1347,  1348,  1349,  1350,  1351,
-      1352,  1353,  1354,  1355,  1356,  1357,  1358,  1359,
-      1360,  1361,  1362,  1363,  1364,  1365,  1366,  1367,
-      1368,  1369,  1370,  1371,  1372,  1373,  1374,  1375,
-      1376,  1377,  1378,  1379,  1380,  1381,  1382,  1383,
-      1384,  1385,  1386,  1387,  1388,  1389,  1390,  1391,
-      1392,  1393,  1394,  1395,  1396,  1397,  1398,  1399,
-      1400,  1401,  1402,  1403,  1404,  1405,  1406,  1407,
-      1408,  1409,  1410,  1411,  1412,  1413,  1414,  1415,
-      1416,  1417,  1418,  1419,  1420,  1421,  1422,  1423,
-      1424,  1425,  1426,  1427,  1428,  1429,  1430,  1431,
-      1432,  1433,  1434,  1435,  1436,  1437,  1438,  1439,
-      1440,  1441,  1442,  1443,  1444,  1445,  1446,  1447,
-      1448,  1449,  1450,  1451,  1452,  1453,  1454,  1455,
-      1456,  1457,  1458,  1459,  1460,  1461,  1462,  1463,
-      1464,  1465,  1466,  1467,  1468,  1469,  1470,  1471,
-      1472,  1473,  1474,  1475,  1476,  1477,  1478,  1479,
-      1480,  1481,  1482,  1483,  1484,  1485,  1486,  1487,
-      1488,  1489,  1490,  1491,  1492,  1493,  1494,  1495,
-      1496,  1497,  1498,  1499,  1500,  1501,  1502,  1503,
-      1504,  1505,  1506,  1507,  1508,  1509,  1510,  1511,
-      1512,  1513,  1514,  1515,  1516,  1517,  1518,  1519,
-      1520,  1521,  1522,  1523,  1524,  1525,  1526,  1527,
-      1528,  1529,  1530,  1531,  1532,  1533,  1534,  1535,
-      1536,  1537,  1538,  1539,  1540,  1541,  1542,  1543,
-      1544,  1545,  1546,  1547,  1548,  1549,  1550,  1551,
-      1552,  1553,  1554,  1555,  1556,  1557,  1558,  1559,
-      1560,  1561,  1562,  1563,  1564,  1565,  1566,  1567,
-      1568,  1569,  1570,  1571,  1572,  1573,  1574,  1575,
-      1576,  1577,  1578,  1579,  1580,  1581,  1582,  1583,
-      1584,  1585,  1586,  1587,  1588,  1589,  1590,  1591,
-      1592,  1593,  1594,  1595,  1596,  1597,  1598,  1599,
-      1600,  1601,  1602,  1603,  1604,  1605,  1606,  1607,
-      1608,  1609,  1610,  1611,  1612,  1613,  1614,  1615,
-      1616,  1617,  1618,  1619,  1620,  1621,  1622,  1623,
-      1624,  1625,  1626,  1627,  1628,  1629,  1630,  1631,
-      1632,  1633,  1634,  1635,  1636,  1637,  1638,  1639,
-      1640,  1641,  1642,  1643,  1644,  1645,  1646,  1647,
-      1648,  1649,  1650,  1651,  1652,  1653,  1654,  1655,
-      1656,  1657,  1658,  1659,  1660,  1661,  1662,  1663,
-      1664,  1665,  1666,  1667,  1668,  1669,  1670,  1671,
-      1672,  1673,  1674,  1675,  1676,  1677,  1678,  1679,
-      1680,  1681,  1682,  1683,  1684,  1685,  1686,  1687,
-      1688,  1689,  1690,  1691,  1692,  1693,  1694,  1695,
-      1696,  1697,  1698,  1699,  1700,  1701,  1702,  1703,
-      1704,  1705,  1706,  1707,  1708,  1709,  1710,  1711,
-      1712,  1713,  1714,  1715,  1716,  1717,  1718,  1719,
-      1720,  1721,  1722,  1723,  1724,  1725,  1726,  1727,
-      1728,  1729,  1730,  1731,  1732,  1733,  1734,  1735,
-      1736,  1737,  1738,  1739,  1740,  1741,  1742,  1743,
-      1744,  1745,  1746,  1747,  1748,  1749,  1750,  1751,
-      1752,  1753,  1754,  1755,  1756,  1757,  1758,  1759,
-      1760,  1761,  1762,  1763,  1764,  1765,  1766,  1767,
-      1768,  1769,  1770,  1771,  1772,  1773,  1774,  1775,
-      1776,  1777,  1778,  1779,  1780,  1781,  1782,  1783,
-      1784,  1785,  1786,  1787,  1788,  1789,  1790,  1791,
-      1792,  1793,  1794,  1795,  1796,  1797,  1798,  1799,
-      1800,  1801,  1802,  1803,  1804,  1805,  1806,  1807,
-      1808,  1809,  1810,  1811,  1812,  1813,  1814,  1815,
-      1816,  1817,  1818,  1819,  1820,  1821,  1822,  1823,
-      1824,  1825,  1826,  1827,  1828,  1829,  1830,  1831,
-      1832,  1833,  1834,  1835,  1836,  1837,  1838,  1839,
-      1840,  1841,  1842,  1843,  1844,  1845,  1846,  1847,
-      1848,  1849,  1850,  1851,  1852,  1853,  1854,  1855,
-      1856,  1857,  1858,  1859,  1860,  1861,  1862,  1863,
-      1864,  1865,  1866,  1867,  1868,  1869,  1870,  1871,
-      1872,  1873,  1874,  1875,  1876,  1877,  1878,  1879,
-      1880,  1881,  1882,  1883,  1884,  1885,  1886,  1887,
-      1888,  1889,  1890,  1891,  1892,  1893,  1894,  1895,
-      1896,  1897,  1898,  1899,  1900,  1901,  1902,  1903,
-      1904,  1905,  1906,  1907,  1908,  1909,  1910,  1911,
-      1912,  1913,  1914,  1915,  1916,  1917,  1918,  1919,
-      1920,  1921,  1922,  1923,  1924,  1925,  1926,  1927,
-      1928,  1929,  1930,  1931,  1932,  1933,  1934,  1935,
-      1936,  1937,  1938,  1939,  1940,  1941,  1942,  1943,
-      1944,  1945,  1946,  1947,  1948,  1949,  1950,  1951,
-      1952,  1953,  1954,  1955,  1956,  1957,  1958,  1959,
-      1960,  1961,  1962,  1963,  1964,  1965,  1966,  1967,
-      1968,  1969,  1970,  1971,  1972,  1973,  1974,  1975,
-      1976,  1977,  1978,  1979,  1980,  1981,  1982,  1983,
-      1984,  1985,  1986,  1987,  1988,  1989,  1990,  1991,
-      1992,  1993,  1994,  1995,  1996,  1997,  1998,  1999,
-      2000,  2001,  2002,  2003,  2004,  2005,  2006,  2007,
-      2008,  2009,  2010,  2011,  2012,  2013,  2014,  2015,
-      2016,  2017,  2018,  2019,  2020,  2021,  2022,  2023,
-      2024,  2025,  2026,  2027,  2028,  2029,  2030,  2031,
-      2032,  2033,  2034,  2035,  2036,  2037,  2038,  2039,
-      2040,  2041,  2042,  2043,  2044,  2045,  2046,  2047 },
-  }
-
-func printDataUnit( dU *[64]int ) {
-    for r := 0; r < 8; r++ {
-        if r == 0 {
-            fmt.Printf( "Data Unit:" )
-        } else {
-            fmt.Printf( "\n          " )
-        }
-        for c := 0; c < 8; c++ {
-            fmt.Printf(" %04d", (*dU)[zigZagRowCol[r][c]] )
-        }
-    }
-    fmt.Printf( "\n" )
-}
-
-func (jpg *JpegDesc) getBits( startByte, val uint, startBit, nBits uint8 ) string {
-
-//    fmt.Printf("startByte %#x val %#x startBit=%d nBits=%d\n",
-//                startByte, val, startBit, nBits)
-    if startBit >= 8 { panic("startBit >= 8") }
-
-    var buf bytes.Buffer
-    if nBits == 0 {
-        fmt.Fprintf( &buf, "offset=%#x [%#02x    .--------]",
-                    startByte, jpg.data[startByte])
-//        fmt.Fprintf( &buf, "                               ")
-    } else {
-//offset=0x269 [0xf5       00111---] Huffman: size 7 (0-runlength 0)
-//offset=0x26a [0xf512     -----101 0001----] DC: decoded=81 cumulative=81
-        fmt.Fprintf( &buf, "offset=%#x [%#02x",
-                    startByte, jpg.data[startByte])
-
-        xBytes :=  (startBit + nBits-1) / 8
-        for i:= uint8(1); i <= xBytes; i++ {
-            fmt.Fprintf( &buf, "%02x", jpg.data[startByte+uint(i)])
-        }
-        for i:= xBytes; i < 2; i++ {
-        	buf.Write([]byte("  "))
-        }
-	    buf.Write([]byte("."))
-        nBytes := xBytes + 1
-
-        //e.g. -----101 0001----
-        var i uint8
-        for ; i < startBit; i++ {
-            buf.Write([]byte("-"))
-        }
-
-        if val > 0xffff { panic("val > 0xffff") }
-
-        s := int(startBit)      // might become negative during operations
-        n := int(nBits)
-
-        if s + n <= 8 {
-            fmt.Fprintf( &buf, "%0*b", n, val )
-        } else {
-            fmt.Fprintf( &buf, "%0*b", 8 - s, val >> uint(s + n - 8) )
-            buf.Write([]byte(" "))
-            s -= 8
-            if s + n > 8 { // at most 7 + 16
-                //fmt.Printf( "reminings bits=%d\n", s + n
-                v := val >> uint(s + n - 8)
-                fmt.Fprintf( &buf, "%0*b", 8, v & 0xff )
-                buf.Write([]byte(" "))
-                s -= 8
-            }
-            //fmt.Printf( "reminings bits=%d\n", s + n
-            val &= ((1 << uint(s + n)) -1)
-            fmt.Fprintf( &buf, "%0*b", s + n, val )
-        }
-        i += nBits
-        //fmt.Printf( "nBytes=%d\n", nBytes )
-        //    fmt.Fprintf( &buf, "%0*b", nBits, val )
-
-        for ; i < nBytes * 8; i++ {
-            if i % 8 == 0   {
-                buf.Write([]byte(" "))
-            }
-            buf.Write([]byte("-"))
-        }
-        buf.Write([]byte("]"))
-    }
-    return buf.String()
-}
-
-func (jpg *JpegDesc) processECS( nMCUs uint) (uint, error) {
-
-    scan := jpg.getCurrentScan()
-    if scan == nil { panic("Internal error (no scan for ECS)\n") }
-
-    /*  after each RST, reset previousDC, dUAnchor, dUCol, dURow & count
-        for each scan component (Y[,Cb,Cr]) */
-    for i := len(scan.mcuD.sComps)-1; i >= 0; i-- {
-        scan.mcuD.sComps[i].previousDC = 0
-        scan.mcuD.sComps[i].dUAnchor = 0  // RST could happen in the middle
-        scan.mcuD.sComps[i].dUCol = 0     
-        scan.mcuD.sComps[i].dURow = 0
-        scan.mcuD.sComps[i].count = 0
-    }
-/*
-    Each scan component (sComp) gives the number of dataUnits that the
-    component can use (hSF *vSF). This is a small rectangular area whose
-    top-left corner is located at dUAnchor in the dUnits array. Area units
-    are located at:
-        dUnits[dUAnchor+(nUnitsRow * dURow) + dUCol], for dUcol in [0, vSF-1]
-                                                      and dUrow in [0, hSF-1].
-    Once the number of vSF * hSF data units have been processed for the same
-    component, unitAnchor is incremented by hSF for the next area, dUrow and
-    dUcol are reset to 0 for the next area, and sCompIndex is incremented
-    modulo the number of components (len(mcusDsc.sComps)).
-
-    Once UnitAnchor is found above nUnitsRow, the whole dUnits array is copied
-    to the component DCT area for further processing, unitAnchor is reset to 0
-    and the same dUnits array is reused for the next slice of data units
-*/
-    sCompIndex := 0                     // first component in MCU (Y)
-    sComp := &scan.mcuD.sComps[0]       // first component definition
-    dUnit := &sComp.dUnits[0]           // first data unit in component
-
-/*
-    Within a data unit, the first sample is always DC and the 63 following
-    samples are AC samples. DC and AC samples are always encoded as a tuple
-    of 2 symbols of varying length: (runSize, code)
-    - runSize is huffman encoded with either DC or AC huffman table. In case of
-      DC, runSize is just the size of the following code in bits. In case of AC
-      it is split into 4-bit runlength of preceding zeros, and 4-bit size of
-      the following code.
-    - code is an offset in rlCodes[size], depending on the previous size:
-      sample value = rlCodes[size][code]
-
-    2 special runSize values are defined:
-    - EOB = 0x00, indicates the end of non-zero samples. EOB applies only to
-      AC samples. In this case all following samples, till the end of the data
-      unit are set to 0 and no more samples for the data unit are expected.
-    - ZRL = 0xf0, indicates a series of 16 zero samples. ZRL applies only to AC
-      samples.
-*/
-    var curHcnode *hcnode = sComp.hDC   // always start with encoded DC
-    huffman := true                     // if true runSize, else code
-
-    var curByte, nBits uint8            // hold current encoded bits
-    var runLen, size uint8              // current decoded runlength & size
-    var codeBit uint8                   // n bits in current code
-    var code uint                       // current code data
-
-    // encoded loop 1 byte at a time: start at 1st byte following header or RST
-    tLen := uint(len( jpg.data ))
-    i := jpg.offset
-
-    var huffbits uint8                  // number of bits encoding value (limited to 16)
-    var huffval uint                    // decoded value
-
-    // for pretty print formatting:
-    var startByte = i                   // offset of the first byte contributing to code
-    var startBit uint8                  // bit offset into startByte
-
-encodedLoop:
-    for ; i < tLen-1; i ++ {
-        curByte = jpg.data[i]           // load next byte
-        nBits = 8                       // 8 bits now available in curByte
-
-        if curByte == 0xFF {
-            i++         // skip expected following 0x00
-            if i >= tLen-1 || jpg.data[i] != 0x00 {
-                i--     // backup for next marker and stop
-                if jpg.Mcu && jpg.Begin <= nMCUs && jpg.End >= nMCUs {
-                    fmt.Printf( "MCU=%d comp=%d du=%d,%d offset=%#x [%#02x] End of scan segment (found marker or RST)\n",
-                                nMCUs, sCompIndex, sComp.dURow, sComp.dUCol, i, curByte )
-                }
-
-                warning := false
-                for k := len(scan.mcuD.sComps)-1; k >= 0; k-- {
-                    if scan.mcuD.sComps[k].dUAnchor != 0 || scan.mcuD.sComps[k].dURow != 0 ||
-                       scan.mcuD.sComps[k].dUCol != 0 || scan.mcuD.sComps[k].count != 0 {
-                        warning = true
-                        fmt.Printf( "Warning: incomplete component %d (%d rows): anchor %d (max %d) row %d col %d count %d\n",
-                                k, scan.mcuD.sComps[k].nRows,
-                                scan.mcuD.sComps[k].dUAnchor,
-                                scan.mcuD.sComps[k].nUnitsRow,
-                                scan.mcuD.sComps[k].dURow,
-                                scan.mcuD.sComps[k].dUCol,
-                                scan.mcuD.sComps[k].count )
-                    }
-                }
-                if warning {
-                    fmt.Printf("MCU=%d comp=%d du=%d,%d offset=%#x [%#02x] Unexpected end of scan segment\n",
-                                nMCUs, sCompIndex, sComp.dURow, sComp.dUCol, i, curByte )
-                }
-                break                   // return condition
-            }
-        }
-        for {                           // curbyte bit loop
-            if huffman {
-                for {                       // huffman bit loop (both DC & AC)
-                    if nBits == 0 { continue encodedLoop } // need more bits
-                        
-                    if (curByte & 0x80) == 0x80 {
-                        if curHcnode.left == nil { panic("Invalid code/huffman tree (left)\n") }
-                        curHcnode = curHcnode.left
-                        huffval <<= 1
-                        huffval ++
-                    } else {
-                        if curHcnode.right == nil { panic("Invalid code/huffman tree (right)\n") }
-                        curHcnode = curHcnode.right
-                        huffval <<= 1
-                    }
-
-                    curByte <<= 1
-                    nBits --
-                    huffbits ++
-
-                    if curHcnode.left == nil && curHcnode.right == nil {
-                        runSize := curHcnode.symbol // if AC first 4 bits are
-                        runLen = runSize >> 4      // runlength, remaining 4
-                        size = runSize & 0x0f      // are size in all cases
-                        if jpg.Mcu && jpg.Begin <= nMCUs && jpg.End >= nMCUs {
-                            fmt.Printf( "MCU=%d comp=%d du=%d,%d %s Huffman: size %d (0-runlength %d)\n",
-                                        nMCUs, sCompIndex, sComp.dURow, sComp.dUCol,
-                                        jpg.getBits( startByte, uint(huffval), startBit, huffbits ),
-                                        size, runLen )
-                        }
-                        startBit += huffbits
-                        huffval = 0
-                        huffbits = 0
-                        huffman = false // next <size> bits are the code
-                        codeBit = 0     // 0 bit of following code is extracted
-                        code = 0
-                        break           // end huffman bit loop
-                    }
-                }
-            } else {                        // extract size bits of code
-                if ( sComp.count == 0 ) {   // first code is for DC
-                    if size > 11 {      // code bits to extract from curByte
-                        return nMCUs, fmt.Errorf("processECS: DC coef size (%d) > 11 bits\n", size)
-                    }
-
-                    for ; codeBit < size; codeBit++ {   // extract code bits
-                        if nBits == 0 { continue encodedLoop }  // need more bits
-
-//                    fmt.Printf( "[MCU=%d nBits=%d] DC: codeBit=%d size=%d code=%#02x\n",
-//                                nMCUs, 8-nBits, codeBit, size, code )
-                        code <<= 1
-                        if curByte & 0x80 == 0x80 {
-                            code += 1
-                        }
-                        curByte <<= 1
-                        nBits --
-                    }
-                    decodedDC := rlCodes[size][code]
-                    sComp.previousDC += decodedDC
-
-                    if jpg.Mcu && jpg.Begin <= nMCUs && jpg.End >= nMCUs {
-                        fmt.Printf( "MCU=%d comp=%d du=%d,%d %s DC: decoded=%d cumulative=%d\n",
-                                    nMCUs, sCompIndex, sComp.dURow, sComp.dUCol,
-                                    jpg.getBits( startByte, code, startBit, size ),
-                                    decodedDC, sComp.previousDC )
-//  fmt.Printf( "[MCU=%d offset=%#x.%d component=%d] DC: size=0x%x, code=%#b (%#02x), decodedDC=%d cumulative DC=%d\n",
-//              nMCUs, i, 8-nBits, sCompIndex, size, code, code, decodedDC, sComp.previousDC )
-                    }
-
-                    (*dUnit)[0] = sComp.previousDC  // store in first slot of current data unit
-
-                    startBit += size
-                    sComp.count = 1         // 1 sample (DC) processed
-                    curHcnode = sComp.hAC   // ready for following AC symbols
-                    huffman = true
-
-                }  else {                   // AC values
-                    if runLen == 0 && size == 0 { // EOB => following AC coefs are 0
-                        if jpg.Mcu && jpg.Begin <= nMCUs && jpg.End >= nMCUs {
-                            fmt.Printf( "MCU=%d comp=%d du=%d,%d %s AC: EOB for this data unit\n",
-                                    nMCUs, sCompIndex, sComp.dURow, sComp.dUCol,
-                                    jpg.getBits( startByte, code, startBit, size ) )
-                        }
-                        for n:= sComp.count; n < 64; n++ {  // in zigzag order
-                            (*dUnit)[n]  = 0
-                        }
-                        sComp.count = 64     // ready for next data unit
-
-                    } else if runLen == 15 && size == 0 {   // ZRL => 16 0s
-                        if jpg.Mcu && jpg.Begin <= nMCUs && jpg.End >= nMCUs {
-                            fmt.Printf( "MCU=%d comp=%d du=%d,%d %s AC: ZRL => next 16 values are 0\n",
-                                    nMCUs, sCompIndex, sComp.dURow, sComp.dUCol,
-                                    jpg.getBits( startByte, code, startBit, size ) )
-                        }
-                        if sComp.count+16 > 64 {
-                            return nMCUs, fmt.Errorf("processECS: ZRL over the end of data uint\n")
-                        }
-                        for n:= uint8(0); n < 16; n++ {     // in zigzag order
-                            (*dUnit)[sComp.count+n] = 0
-                        }
-                        sComp.count += 16
-
-                    } else {                // not a special case, size is not 0
-                        if size < 1 || size > 10 {
-                            return nMCUs, fmt.Errorf("processECS: AC coef size (%d) not in [1-10] bits\n",
-                                                      size)
-                        }
-                        for ; codeBit < size; codeBit++ {
-                            if nBits == 0 { continue encodedLoop }  // need more bits
-
-//                        fmt.Printf( "[MCU=%d offset=%#x.%d] AC: codeBit=%d, size=%d, code=%#02x\n",
-//                                    nMCUs, i, 8-nBits, codeBit, size, code )
-                            code <<= 1
-                            if curByte & 0x80 == 0x80 {
-                                code += 1
-                            }
-                            curByte <<= 1
-                            nBits --
-
-                        }
-                        decodedAC := rlCodes[size][code]
-
-                        if jpg.Mcu && jpg.Begin <= nMCUs && jpg.End >= nMCUs {
-                        fmt.Printf( "MCU=%d comp=%d du=%d,%d %s AC: runlength %d decoded=%d\n",
-                                    nMCUs, sCompIndex, sComp.dURow, sComp.dUCol,
-                                    jpg.getBits( startByte, code, startBit, size ),
-                                    runLen, decodedAC )
-                        }
-                        if sComp.count+runLen > 64 {
-                            return nMCUs, fmt.Errorf("processECS: Runlength %d over the end of data uint\n",
-                                                     runLen)
-                        }
-                        for n:= uint8(0); n < runLen; n++ { // in zigzag order
-                            (*dUnit)[sComp.count+n] = 0
-                        }
-                        sComp.count += runLen
-                        startBit += size
-                        // store decoded AC in next slot of current data unit
-                        (*dUnit)[sComp.count] = decodedAC
-                        sComp.count++
-                    }
-                    if sComp.count == 64 {  // end of data unit
-//                        printDataUnit( dUnit )
-                        sComp.dUCol++
-                        if sComp.dUCol >= sComp.hSF {
-                            sComp.dUCol = 0
-                            sComp.dURow++
-                            if sComp.dURow >= sComp.vSF {
-                                sComp.dURow = 0     // end of current component
-                                sComp.dUAnchor += sComp.hSF // ready for next du
-                                sCompIndex++
-                                if sCompIndex >= len(scan.mcuD.sComps) {
-                                    sCompIndex = 0
-                                    nMCUs ++        // new MCU
-                                }
-//                                fmt.Printf("!!! Switching to component %d\n", sCompIndex)
-                                sComp = &scan.mcuD.sComps[sCompIndex]
-                                if sComp.dUAnchor == sComp.nUnitsRow { // end of DU slice
-                                    if jpg.nMcuRST != 0 && nMCUs % jpg.nMcuRST != 0 {
-                                        fmt.Printf("Warning: end of slice @MCU %d is not synced with RST intervals (%d)\n",
-                                                    nMCUs, jpg.nMcuRST )
-                                    }
-                                    for sci := 0; sci < len(scan.mcuD.sComps); sci++ {
-
-                                        sc := &scan.mcuD.sComps[sci]
-                                        for i := uint(0); i < sc.vSF; i ++ {
-                                            sc.iDCTdata = append( sc.iDCTdata, iDCTRow{} )
-                                            dctRow := len(sc.iDCTdata) - 1
-                                            sc.iDCTdata[dctRow] = append( sc.iDCTdata[dctRow], sc.dUnits[
-                                               (i*sc.nUnitsRow/sc.vSF) :
-                                               (i*sc.nUnitsRow/sc.vSF)+(sc.nUnitsRow/sc.vSF)]... )
-                                            sc.nRows++
-                                        }
-                                        sc.dUAnchor = 0
-                                        sc.dURow = 0
-                                        sc.dUCol = 0
-                                        sc.count = 0
-                                    }
-                                }
-                            }
-                        }
-                        sComp.count = 0
-                        dUnit = &sComp.dUnits[sComp.dUAnchor +
-                                              (sComp.nUnitsRow * sComp.dURow) +
-                                              sComp.dUCol]
-//                        fmt.Printf("Ready for next data unit: component %d anchor %d row %d col %d\n",
-//                                    sCompIndex, sComp.dUAnchor, sComp.dURow, sComp.dUCol)
-                        curHcnode = sComp.hDC   // new data unit starts with DC coefficient
-                    } else {
-                        curHcnode = sComp.hAC   // same data unit, keep working on AC
-                    }
-                    huffman = true
-                    //panic ("Debug\n" )
-                }
-            }
-//            fmt.Printf("startBit %d nBits %d\n", startBit, nBits)
-            startBit %= 8
-            if startBit == 0 {
-                startByte = i+1
-            } else {
-                startByte = i
-            }
-        }
-    }
-
-    jpg.offset = i  // stopped at 0xFF followed by non-zero byte or at tLen-1
-    return nMCUs, nil
-}
-
-func (jpg *JpegDesc) processScan( marker, sLen uint ) error {
-    if jpg.Content {
-        fmt.Printf( "SOS\n" )
-    }
+func (jpg *Desc) processScan( marker, sLen uint ) error {
+//    if jpg.Content { fmt.Printf( "SOS\n" ) }
     if (jpg.state != _SCAN1 && jpg.state != _SCANn) {
         return fmt.Errorf( "processScan: Wrong sequence %s in state %s\n",
                             getJPEGmarkerName(marker), jpg.getJPEGStateName() )
     }
-    if sLen < 6 {   // fixed size besides components
+    if sLen < fixedScanHeaderSize {   // fixed size besides components
         return fmt.Errorf( "processScan: Wrong SOS header (len %d)\n", sLen )
     }
 
-    if err := jpg.processScanHeader( sLen ); err != nil { return err }
-
-    err := jpg.addTable( marker, jpg.offset, jpg.offset + 2 + sLen, original )
+    sc, err := jpg.processScanHeader( sLen );
     if err != nil {
-        return jpgForwardError( "processScan", err )
+        return err
     }
-    if jpg.state == _SCAN1 { jpg.state = _SCAN1_ECS } else { jpg.state = _SCANn_ECS }
+    if jpg.state == _SCAN1 {
+        jpg.state = _SCAN1_ECS
+    } else {
+        jpg.state = _SCANn_ECS
+    }
 
     jpg.offset += sLen + 2
     firstECS := jpg.offset
 
-    if jpg.Content {  fmt.Printf( "  %s @offset 0x%x\n",
-                                  jpg.getJPEGStateName(), jpg.offset ) }
-    rstCount := 0
+    rstCount := uint(0)
     var lastRSTIndex, nIx uint
     var lastRST uint = 7
     tLen := uint(len( jpg.data ))   // start hunting for 0xFFxx with xx != 0x00
 
-    var nMCus uint
+    var nMCUs uint
     for ; ; {   // processECS return upon error, reached EOF or 0xFF followed by non-zero
-        if nMCus, err = jpg.processECS( nMCus ); err != nil {
+        if nMCUs, err = jpg.processECS( nMCUs ); err != nil {
             return jpgForwardError( "processScan", err )
         }
         nIx = jpg.offset
@@ -1200,14 +506,17 @@ func (jpg *JpegDesc) processScan( marker, sLen uint ) error {
         }       // else one of RST0-7 embedded in scan data, keep going
 
         RST := uint( jpg.data[nIx+1] - 0xd0 )
-        if (lastRST + 1) % 8 != RST {
-            if jpg.Fix {
-                RST = (lastRST + 1) % 8
-                jpg.data[nIx+1] = byte(0xd0 + RST)
-                fmt.Printf( "  FIXING: setting RST sequence: %d\n", RST )
-            } else {
-                fmt.Printf( "  WARNING: invalid RST sequence (%d, expected %d)\n", RST, (lastRST + 1) % 8 )
+        if (lastRST + 1) % 8 != RST { // don't try to fix it, as it may indicate
+                                      // a corrupted file with missing samples.
+            if jpg.Warn {
+                fmt.Printf( "  WARNING: invalid RST sequence (%d, expected %d)\n",
+                            RST, (lastRST + 1) % 8 )
             }
+//            if jpg.Fix {
+//                RST = (lastRST + 1) % 8
+//                jpg.data[nIx+1] = byte(0xd0 + RST)
+//                fmt.Printf( "  FIXING: setting RST sequence: %d\n", RST )
+//            }
         }
         lastRSTIndex = nIx
         lastRST = RST
@@ -1215,90 +524,202 @@ func (jpg *JpegDesc) processScan( marker, sLen uint ) error {
 
         jpg.offset += 2;    // skip RST
     }
-//    fmt.Printf( "End of scan @0x%08x (lastRst 0x%08x)\n", nIx, lastRSTIndex )
-    if jpg.Content {
-        fmt.Printf( "  Actual number of Mcus in scan %d\n", nMCus )
-        fmt.Printf( "  %d restart intervals\n", rstCount )
-    }
 
     if lastRSTIndex == nIx - 2 {
-        if jpg.Fix {
+        if jpg.Warn {
+            fmt.Printf( "  WARNING: ending RST is useless\n" )
+        }
+        if jpg.TidyUp {
             nIx -= 2
             fmt.Printf( "  FIXING: Removing ending RST (useless)\n" )
-        } else {
-            fmt.Printf( "  WARNING: ending RST is useless\n" )
         }
     }
 
-    err = jpg.addECS( firstECS, nIx, original, nMCus )
-    if err != nil {
-        return jpgForwardError( "processScan", err )
-    }
-    jpg.scans = append( jpg.scans, scan{ } )    // ready for next scan
+    sc.ECSs = jpg.data[firstECS:nIx]
+    sc.nMcus = nMCUs
+    sc.rstCount = rstCount
+    frm := jpg.getCurrentFrame( )
+    frm.scans = append( frm.scans, scan{ } )    // ready for next scan
     jpg.state = _SCANn
+
+    jpg.addSeg( sc )
     return nil
 }
 
-func (jpg *JpegDesc)defineRestartInterval( marker, sLen uint ) error {
-    offset := jpg.offset + 4
-    restartInterval := uint(jpg.data[offset]) << 8 + uint(jpg.data[offset+1])
-    jpg.nMcuRST = restartInterval
+// ----------------- Restart Intervals
 
-    if jpg.Content {
-        fmt.Printf( "DRI\n" )
-        fmt.Printf( "  Restart Interval %d\n", restartInterval )
-        if jpg.resolution.nSamplesLine % restartInterval != 0 {
-            fmt.Printf( "  Warning number of samples per line (%d) is not a multiple of the restart interval\n",
-                        jpg.resolution.nSamplesLine )
-        }
-    }
-    return jpg.addTable( marker, jpg.offset, jpg.offset + 2 + sLen, original )
+type riSeg struct {
+    interval    uint16
 }
 
-var zigZagRowCol = [8][8]int{{  0,  1,  5,  6, 14, 15, 27, 28 },
-                             {  2,  4,  7, 13, 16, 26, 29, 42 },
-                             {  3,  8, 12, 17, 25, 30, 41, 43 },
-                             {  9, 11, 18, 24, 31, 40, 44, 53 },
-                             { 10, 19, 23, 32, 39, 45, 52, 54 },
-                             { 20, 22, 33, 38, 46, 51, 55, 60 },
-                             { 21, 34, 37, 47, 50, 56, 59, 61 },
-                             { 35, 36, 48, 49, 57, 58, 62, 63 }}
+func (rs *riSeg)serialize( w io.Writer ) (int, error) {
+    seg := make( []byte, restartIntervalSize + 2 )
+    binary.BigEndian.PutUint16( seg, _DRI )
+    binary.BigEndian.PutUint16( seg[2:], restartIntervalSize )
+    binary.BigEndian.PutUint16( seg[4:], rs.interval )
+    return w.Write( seg )
+}
 
-func (jpg *JpegDesc)printQuantizationMatrix( pq, tq uint ) {
+func (rs *riSeg)format( w io.Writer ) (n int, err error) {
+    n, err = fmt.Fprintf( w, "  Define Restart Interval:\n    Interval %d MCUs\n",
+                          rs.interval )
+    if err != nil { err = fmt.Errorf( "format: %w", err ) }
+    return
+}
 
-    fmt.Printf( "  Zig-Zag: " )
-    var f string
-    if pq != 0 { f = "%5d " } else { f = "%3d " }
+func (jpg *Desc)defineRestartInterval( marker, sLen uint ) error {
+    offset := jpg.offset + 4
+    restartInterval := uint16(jpg.data[offset]) << 8 + uint16(jpg.data[offset+1])
 
-    for i := 0; ;  {
+    rs := new( riSeg )
+    rs.interval = restartInterval
+    jpg.nMcuRST = uint(restartInterval)
+
+    frm := jpg.getCurrentFrame( )
+    if frm != nil && frm.resolution.nSamplesLine % restartInterval != 0 {
+        if jpg.Warn {
+            fmt.Printf( "  Warning: number of samples per line (%d) is not a" +
+                        " multiple of the restart interval\n",
+                        frm.resolution.nSamplesLine )
+        }
+    }
+    jpg.addSeg( rs )
+    return nil
+}
+
+// ------------------ Quantization
+
+type qtSeg struct {
+    data    [][65]uint16    // slice of qt arrays (pq,tq)+64entries
+}
+
+func (qt *qtSeg)destinations( ) []uint {
+    var ds []uint
+    for _, v := range qt.data {
+        ds = append( ds, uint( v[0] & 0x0f ) )
+    }
+    return ds
+}
+
+func (qt *qtSeg)matchDestination( start int, d uint ) int {
+    ds := qt.destinations()
+    for i := start; i < len(ds); i++ {
+        if ds[i] == d {
+            return i
+        }
+    }
+    return -1
+}
+
+func (qs *qtSeg)serialize( w io.Writer ) (int, error) {
+    n := len(qs.data)
+    lq := uint16(2)
+    for i := 0; i < n; i++ {
+        lq += 65 + ( 64 * ( qs.data[i][0] >> 8) )
+    }
+    seg := make( []byte, lq + 2 )
+    binary.BigEndian.PutUint16( seg[0:], _DQT )
+    binary.BigEndian.PutUint16( seg[2:], lq )
+
+    j := 4
+    for i := 0; i < n; i++ {
+        p := byte(qs.data[i][0] >> 8)
+        d := byte(qs.data[i][0])
+        seg[j] = (p << 4) | d
+        j++
+        if p == 0 {
+            for k := 1; k < 65; k++ {
+                seg[j] = byte(qs.data[i][k])
+                j++
+            }
+        } else {
+            for k := 1; k < 65; k++ {
+                binary.BigEndian.PutUint16( seg[j:], qs.data[i][k] )
+                j += 2
+            }
+        }
+    }
+    return w.Write( seg )
+}
+
+func formatZigZag( cw *cumulativeWriter, f string, qt *[65]uint16 ) {
+    cw.format( "    Zig-Zag: " )
+    for i := 1; ;  {
         for j := 0; j < 8; j++ {
-            fmt.Printf( f, jpg.qdefs[tq].values[i+j] )
+            cw.format( f, qt[i+j] )
         }
         i += 8
-        if i == 64 { break }
-        fmt.Printf( "\n           " )
+        if i == 65 { break }
+        cw.format(  "\n             " )
     }
-    fmt.Printf( "\n" )
+    cw.format( "\n" )
+}
 
-    for i := 0; i < 8; i++ {
-        fmt.Printf( "  Row %d: [ ", i )
-        for j := 0; j < 8; j++ {
-            fmt.Printf( f, jpg.qdefs[tq].values[zigZagRowCol[i][j]] )
+func formatQuantizationDest( cw *cumulativeWriter,
+                             qt *[65]uint16, m FormatMode ) {
+
+    d := qt[0]
+    p := ((d >> 4) + 1) << 3
+    d &= 0x0f
+
+    cw.format( "  Quantization table: %d\n", d )
+    cw.format( "    Precision: %d-bit\n", p )
+
+    var f string
+    if p != 8 { f = "%5d " } else { f = "%3d " }
+
+    if m == Standard || m == Both {
+        formatZigZag( cw, f, qt )
+    }
+
+    if m == Extra || m == Both {
+        for i := 0; i < 8; i++ {
+            cw.format( "    Row %d: [ ", i )
+            for j := 0; j < 8; j++ {
+                cw.format( f, qt[1+zigZagRowCol[i][j]] )
+            }
+            cw.format( "]\n" )
         }
-        fmt.Printf("]\n")
     }
 }
 
-func (jpg *JpegDesc)defineQuantizationTable( marker, sLen uint ) ( err error ) {
+func (qs *qtSeg)formatDestAt( cw *cumulativeWriter, index int,
+                              mode FormatMode ) {
+    if index < 0 || index > len(qs.data) {
+        cw.setError( fmt.Errorf( "index %d out of range\n", index ) )
+    } else {
+        formatQuantizationDest( cw, &qs.data[index], mode )
+    }
+}
+
+func (qs *qtSeg)formatAllDest( cw *cumulativeWriter, m FormatMode ) {
+    for _, qt := range qs.data {
+        formatQuantizationDest( cw, &qt, m )
+    }
+}
+
+func (qs *qtSeg)format( w io.Writer ) (n int, err error) {
+    cw := newCumulativeWriter( w )
+    for _, qt := range qs.data {
+        formatQuantizationDest( cw, &qt, Standard )
+    }
+    n, err = cw.result()
+    if err != nil { err = fmt.Errorf( "format: %w", err ) }
+    return
+}
+
+func (jpg *Desc)defineQuantizationTable( marker, sLen uint ) ( err error ) {
 
     end := jpg.offset + 2 + sLen
     offset := jpg.offset + 4
+    qtn := int(0)
+    qts := new( qtSeg )
 
-    if jpg.Content { fmt.Printf( "DQT\n") }
-
-    for qt := 0; ; qt++ {
-        pq := uint(jpg.data[offset]) >> 4
-        tq := uint(jpg.data[offset]) & 0x0f
+    for ; ; qtn++ { // Mutiple QTs can be combined in a single DQT segment
+        pq := uint(jpg.data[offset]) >> 4 // Quantization table element precision
+// 0 => 8-bit values; 1 => 16-bit values. Shall be 0 for 8-bit sample precision.
+        tq := uint(jpg.data[offset]) & 0x0f // Quantization table destination id
+// destination id [0-3] into which the quantization table shall be installed.
         if pq > 1 {
             return fmt.Errorf( "defineQuantizationTable: Wrong precision (%d)\n", pq )
         }
@@ -1306,13 +727,11 @@ func (jpg *JpegDesc)defineQuantizationTable( marker, sLen uint ) ( err error ) {
             return fmt.Errorf( "defineQuantizationTable: Wrong destination (%d)\n", pq )
         }
 
-        if jpg.Content {
-            fmt.Printf( "  Quantization value precision %d destination %d\n",
-                        8 * (pq+1), tq )
-        }
+        qts.data = append( qts.data, [65]uint16{} )
+        qts.data[qtn][0] = (uint16(pq) << 8) | uint16(tq)
 
         offset ++
-        jpg.qdefs[tq].precision = pq != 0
+        jpg.qdefs[tq].size = 8 * (pq+1)
         for i := 0; i < 64; i++ {
             jpg.qdefs[tq].values[i] = uint16(jpg.data[offset])
             offset ++
@@ -1321,12 +740,7 @@ func (jpg *JpegDesc)defineQuantizationTable( marker, sLen uint ) ( err error ) {
                 jpg.qdefs[tq].values[i] += uint16(jpg.data[offset])
                 offset++
             }
-        }
-        if jpg.Quantizers {
-            if ! jpg.Content {
-                fmt.Printf( "Quantization table for destination %d\n", tq )
-            }
-            jpg.printQuantizationMatrix( pq, tq )
+            qts.data[qtn][i+1] = jpg.qdefs[tq].values[i]
         }
         if offset >= end {
             break
@@ -1336,18 +750,49 @@ func (jpg *JpegDesc)defineQuantizationTable( marker, sLen uint ) ( err error ) {
         return fmt.Errorf( "defineQuantizationTable: Invalid DQT length: %d actual: %d\n",
                            sLen, offset - jpg.offset -2 )
     }
-    return jpg.addTable( marker, jpg.offset, end, original )
+    if qtn > 0 {
+        jpg.addSeg( qts )
+    } else if jpg.Warn {
+        fmt.Printf("defineQuantizationTable: Warning: empty segment (ignoring)\n")
+    }
+    return nil
 }
 
-func buildTree( huffDef *hdef ) {
+// --------------- huffman tables
 
-    huffDef.root = new( hcnode )
-    var last *hcnode = huffDef.root
+func printTree( cw *cumulativeWriter, root *hcnode, indent string ) {
+    cw.format(  "%sHuffman codes:\n", indent );
+
+    var buffer  []uint8
+    var printNodes func( *hcnode ); printNodes = func( hcn *hcnode ) {
+        if hcn.left == nil && hcn.right == nil {
+            cw.format( "%s%s: 0x%02x\n", indent, string(buffer), hcn.symbol )
+            buffer = buffer[:len(buffer)-1]
+        } else {    // right is always present
+            buffer = append( buffer, '0' )
+            printNodes( hcn.right )
+            if hcn.left != nil {
+                buffer = append( buffer, '1' )
+                printNodes( hcn.left )
+            }
+            hcn = hcn.parent;
+            if hcn != nil {
+                buffer = buffer[:len(buffer)-1]
+            }
+        }
+    }
+    printNodes( root )
+}
+
+func buildTree( values [16][]uint8 ) (root *hcnode) {
+
+    root = new( hcnode )
+    var last *hcnode = root
     var level uint
 
     for i := uint(0); i < 16; i++ {
         cl := i + 1                                     // code length
-        for _, symbol := range huffDef.cdefs[i].values {
+        for _, symbol := range values[i] {
 //            fmt.Printf( "Symbol 0x%02x length %d\n", symbol, cl )
             for ; level < cl; {
                 if nil == last.right {
@@ -1379,114 +824,180 @@ func buildTree( huffDef *hdef ) {
             level--
         }
     }
+    return
 }
 
-func printTree( root *hcnode, indent string ) {
-    fmt.Printf( "Huffman codes:\n" );
+type htcd struct {
+    data    [16][]uint8 // table data
+    hc      byte        // class [0-1]
+    hd      byte        // destination [0-3]
+}
 
-    var buffer  []uint8
+type htSeg struct {
+    htcds   []htcd
+}
 
-    var printNodes func( n *hcnode )
-    printNodes = func( n *hcnode ) {
-        if n.left == nil && n.right == nil {
-            fmt.Printf( "%s%s: 0x%02x\n", indent, string(buffer), n.symbol )
-            buffer = buffer[:len(buffer)-1]
-        } else {    // right is always present
-            buffer = append( buffer, '0' )
-            printNodes( n.right )
-            if n.left != nil {
-                buffer = append( buffer, '1' )
-                printNodes( n.left )
-            }
-            n = n.parent;
-            if n != nil {
-                buffer = buffer[:len(buffer)-1]
-            }
+func (hs *htSeg)serialize( w io.Writer ) (int, error) {
+    lh := uint16(2)
+    for i := 0; i < len(hs.htcds); i++ {
+        sz := 17
+        for j := 0; j < 16; j++ {
+            sz += len(hs.htcds[i].data[j])
+        }
+//        fmt.Printf( "nb values for table %d class %d dest %d is %d\n",
+//                    i, hs.htcds[i].hc, hs.htcds[i].hd, sz )
+        lh += uint16(sz)
+    }
+//    fmt.Printf( "Total huffman segment length = %d\n", lh )
+
+    seg := make( []byte, lh + 2 )
+    binary.BigEndian.PutUint16( seg[0:], _DHT )
+    binary.BigEndian.PutUint16( seg[2:], lh )
+    j := 4
+    for i := 0; i < len(hs.htcds); i++ {
+        seg[j] = (hs.htcds[i].hc << 4) | hs.htcds[i].hd
+        j++
+//        sz := 0
+        for k := 0; k < 16; k++ {
+//            sz += len(hs.htcds[i].data[k])
+            seg[j] = byte( len(hs.htcds[i].data[k]) )
+            j++
+        }
+        for k := 0; k < 16; k++ {
+            copy( seg[j:], hs.htcds[i].data[k] )
+            j+= len( hs.htcds[i].data[k] )
         }
     }
-    printNodes( root )
+    return w.Write( seg )
 }
 
-func (jpg *JpegDesc)printHuffmanTable( td uint ) {
+type classDestination struct {
+    hc      byte        // class [0-1]
+    hd      byte        // destination [0-3]
+}
 
-    fmt.Printf( "code lengths and symbols:\n" )
-
-    var nSymbols uint
-    for i := 0; i < 16; i++ {
-        if jpg.hdefs[td].cdefs[i].length == 0 { continue }
-
-        nSymbols += jpg.hdefs[td].cdefs[i].length
-        fmt.Printf( "    length %2d: %3d symbols: [ ",
-                    i+1, jpg.hdefs[td].cdefs[i].length )
-VALUE_LOOP:
-        for j := uint(0); ;  {
-            for k := uint(0); k < 8; k++ {
-                if j+k >= jpg.hdefs[td].cdefs[i].length { break VALUE_LOOP }
-                fmt.Printf( "0x%02x ", jpg.hdefs[td].cdefs[i].values[j+k] )
-            }
-            fmt.Printf("\n                              ")
-            j += 8
-        }
-        fmt.Printf( "]\n" )
+func (hs *htSeg)classDestinations( ) []classDestination {
+    var cds []classDestination
+    for _, v := range hs.htcds {
+        cds = append( cds, classDestination{ v.hc, v.hd } )
     }
-    fmt.Printf("    Total number of symbols: %d\n", nSymbols )
+    return cds
 }
 
-func (jpg *JpegDesc)defineHuffmanTable( marker, sLen uint ) ( err error ) {
+func (hs *htSeg)matchClassDestination( start int, c, d byte ) int {
+    cds := hs.classDestinations()
+    // c: 0=DC 1=AC d: 0-3
+    for i := start; i < len(cds); i++ {
+        if cds[i].hc == c && cds[i].hd == d {
+            return i
+        }
+    }
+    return -1
+}
+
+func formatHuffmanDest( cw *cumulativeWriter, ht *htcd, mode FormatMode ) {
+
+    var class string
+    if ht.hc == 0 {
+        class = "DC"
+    } else {
+        class = "AC"
+    }
+
+    cw.format( "  Huffman table %s%d\n", class, ht.hd )
+    if mode == Standard || mode == Both {
+        cw.format( "    Code lengths and symbols:\n" )
+
+        var nSymbols uint
+        for i := 0; i < 16; i++ {
+            li := uint( len(ht.data[i]) )
+            if li == 0 {
+                continue
+            }
+            nSymbols += li
+            cw.format( "    length %2d: %3d symbols: [ ", i+1, li )
+
+    VALUE_LOOP:
+            for j := uint(0); ;  {
+                for k := uint(0); k < 8; k++ {
+                    if j+k >= li {
+                        break VALUE_LOOP
+                    }
+                    cw.format( "0x%02x ", ht.data[i][j+k] )
+                }
+                cw.format(  "\n                              ")
+                j += 8
+            }
+            cw.format( "]\n" )
+        }
+        cw.format( "    Total number of symbols: %d\n", nSymbols )
+    }
+    if mode == Extra || mode == Both {
+        root := buildTree( ht.data )
+        printTree( cw, root, "    " )
+    }
+    return
+}
+
+func (hs *htSeg)formatDestAt( cw *cumulativeWriter, index int,
+                              mode FormatMode ) {
+    if index < 0 || index > len(hs.htcds) {
+        cw.setError( fmt.Errorf( "index %d out of range\n", index ) )
+    } else {
+        formatHuffmanDest( cw, &hs.htcds[index], mode )
+    }
+}
+
+func (hs *htSeg)formatAllDest( cw *cumulativeWriter, m FormatMode ) {
+    for _, ht := range hs.htcds {
+        formatHuffmanDest( cw, &ht, m )
+    }
+}
+
+func (hs *htSeg)format( w io.Writer ) (n int, err error) {
+    cw := newCumulativeWriter( w )
+    for _, ht := range hs.htcds {
+        formatHuffmanDest( cw, &ht, Standard )
+    }
+    n, err = cw.result()
+    if err != nil { err = fmt.Errorf( "format: %w", err ) }
+    return
+}
+
+func (jpg *Desc)defineHuffmanTable( marker, sLen uint ) ( err error ) {
 
     end := jpg.offset + 2 + sLen
     offset := jpg.offset + 4
 
-    if jpg.Content { fmt.Printf( "DHT\n") }
-
-    for ht := 0; ; ht++ {
+    hts := new( htSeg )
+    ht := 0
+    for ; ; ht++ {
         tc := uint(jpg.data[offset]) >> 4
         th := uint(jpg.data[offset]) & 0x0f
 
-        if tc > 1 || th > 1 {
+        if tc > 1 || th > 3 {
             return fmt.Errorf( "defineHuffmanTable: Wrong table class/destination (%d/%d)\n", tc, th )
         }
 
-        var class string
-        if tc == 0 { class = "DC" } else { class = "AC" }
+        hts.htcds = append( hts.htcds, htcd{ } )
+        hts.htcds[ht].hc = byte(tc)
+        hts.htcds[ht].hd = byte(th)
 
-        if jpg.Content {
-            fmt.Printf( "  Huffman table class %s destination %d ", class, th )
-        }
-
-        td := 2*th+tc // use 2 tables, 1 for DC and 1 for AC, per destination
+        td := 2*th+tc // use 8 tables, (1 for DC + 1 for AC per destination) * 4
         offset++
         voffset := offset+16
 
         for hcli := uint(0); hcli < 16; hcli++ {
-            jpg.hdefs[td].cdefs[hcli].length = uint(jpg.data[offset+hcli])
-            for hvi := uint(0); hvi < jpg.hdefs[td].cdefs[hcli].length; hvi++ {
-                jpg.hdefs[td].cdefs[hcli].values =
-                   append( jpg.hdefs[td].cdefs[hcli].values, jpg.data[voffset+hvi] )
-            }
-            voffset += jpg.hdefs[td].cdefs[hcli].length
+            li := uint(jpg.data[offset+hcli])
+            jpg.hdefs[td].values[hcli] = append(
+                   jpg.hdefs[td].values[hcli], jpg.data[voffset:voffset+li]... )
+            // since another definition can replace data at destination, a copy
+            // is necessary here in order to keep the original definition.
+            hts.htcds[ht].data[hcli] = make( []byte, li )
+            copy( hts.htcds[ht].data[hcli], jpg.hdefs[td].values[hcli] )
+            voffset += li
         }
-        buildTree( &jpg.hdefs[td] )
-
-        if jpg.Lengths {
-            if ! jpg.Content {
-                fmt.Printf( "Huffman table class %s destination %d ", class, th )
-            }
-            jpg.printHuffmanTable( td )
-        }
-
-        if jpg.Codes {
-            var indent string = "    "
-            if jpg.Lengths {
-                fmt.Printf( "   " )
-            } else if ! jpg.Content {
-                fmt.Printf( "Huffman table class %s destination %d ", class, th )
-                indent = "  "
-            } 
-            printTree( jpg.hdefs[td].root, indent )
-        } else if jpg.Content && ! jpg.Lengths {
-            fmt.Printf( "\n" )
-        }
+        jpg.hdefs[td].root = buildTree( jpg.hdefs[td].values )
 
         offset = voffset;
         if offset >= end {
@@ -1494,27 +1005,75 @@ func (jpg *JpegDesc)defineHuffmanTable( marker, sLen uint ) ( err error ) {
         }
     }
     if offset != end {
-        return fmt.Errorf( "defineHuffmanTable: Invalid DHT length: %d actual: %d\n", sLen, offset - jpg.offset -2 )
+        return fmt.Errorf( "defineHuffmanTable: Invalid DHT length: %d actual: %d\n",
+                           sLen, offset - jpg.offset -2 )
     }
-    return jpg.addTable( marker, jpg.offset, end, original )
-}
-
-func (jpg *JpegDesc)commentSegment( marker, sLen uint ) error {
-    if jpg.Content {
-        offset := jpg.offset
-        var b bytes.Buffer
-        s := jpg.data[offset:offset+sLen]
-        b.Write( s )
-        fmt.Printf( "COM\n" )
-        fmt.Printf( "  %s\n", b.String() )
+    if ht > 0 {
+        jpg.addSeg( hts )
+    } else if jpg.Warn {
+        fmt.Printf("defineHuffmanTable: Warning: empty segment (ignoring)\n")
     }
     return nil
 }
 
-func (jpg *JpegDesc)defineNumberOfLines( marker, sLen uint ) ( err error ) {
-    if jpg.Content {
-        fmt.Printf( "DNL\n" )
+// -------------- comment segment
+
+type comSeg struct {
+    text    []byte
+}
+
+func (c *comSeg)serialize( w io.Writer ) (int, error) {
+    size  := fixedCommentHeaderSize + uint16( len(c.text) )
+    seg := make( []byte, size + 2 )
+    binary.BigEndian.PutUint16( seg, _COM )
+    binary.BigEndian.PutUint16( seg[2:], size )
+    copy(seg[4:], c.text )
+    return w.Write( seg )
+}
+
+func (c *comSeg)format( w io.Writer ) (n int, err error) {
+    n, err = fmt.Fprintf( w, "Comment:\n  \"%s\"\n",
+                          string(c.text) )
+    if err != nil { err = fmt.Errorf( "format: %w", err ) }
+    return
+}
+
+func (jpg *Desc)commentSegment( marker, sLen uint ) error {
+    offset := jpg.offset
+    var b bytes.Buffer
+    s := jpg.data[offset:offset+sLen]
+    b.Write( s )
+    c := new(comSeg)
+    c.text = b.Bytes()
+    jpg.addSeg( c )
+    return nil
+}
+
+// ----------------- define number of lines
+
+type dnlSeg struct {
+    nLines  uint16
+    toRemove bool
+}
+
+func (d *dnlSeg)serialize( w io.Writer ) (int, error) {
+    if d.toRemove {
+        return 0, nil
     }
+    seg := make( []byte, defineNumberOfLinesSize + 2 )
+    binary.BigEndian.PutUint16( seg, _DNL )
+    binary.BigEndian.PutUint16( seg[2:], defineNumberOfLinesSize )
+    binary.BigEndian.PutUint16( seg[4:], d.nLines )
+    return w.Write( seg )
+}
+
+func (d *dnlSeg)format( w io.Writer ) (n int, err error) {
+    n, err = fmt.Fprintf( w, "Define Number Of Lines:\n  number of lines %d\n",
+                          d.nLines )
+    return
+}
+
+func (jpg *Desc)defineNumberOfLines( marker, sLen uint ) ( err error ) {
     if jpg.state != _SCANn {
         return fmt.Errorf( "defineNumberOfLines: Wrong sequence %s in state %s\n",
                        getJPEGmarkerName(marker), jpg.getJPEGStateName() )
@@ -1522,367 +1081,54 @@ func (jpg *JpegDesc)defineNumberOfLines( marker, sLen uint ) ( err error ) {
     if sLen != 4 {   // fixed size
         return fmt.Errorf( "defineNumberOfLines: Wrong DNL header (len %d)\n", sLen )
     }
-    if jpg.pDNL {
+    cf := jpg.getCurrentFrame()
+    if cf == nil { panic("defineNumberOfLines: no current frame\n") }
+    if cf.resolution.dnlLines != 0 {
         return fmt.Errorf( "defineNumberOfLines: Multiple DNL tables\n" )
     }
 
-    jpg.pDNL = true
     offset := jpg.offset + 4
-
-    var nLines uint
-    if jpg.Content {
-        nLines = uint(jpg.data[offset]) << 8 + uint(jpg.data[offset+1])
-        fmt.Printf( "  Number of Lines: %d\n", nLines )
-    }
-    jpg.gDNLnLines = nLines
-
-    // find SOFn segment, which is the last table in global tables
-    sof := jpg.getLastGlobalTable()
-    if sof == nil || sof.stop - sof.start < 8 { panic("Internal error\n") }
-
-    var prevLines uint
-    if sof.from == original {
-        prevLines = uint(jpg.data[sof.start + 5]) << 8 + uint(jpg.data[sof.start + 6])
-    } else {
-        prevLines = uint(jpg.update[sof.start + 5]) << 8 + uint(jpg.update[sof.start + 6])
-    }
-
-    if jpg.Fix {    // fix SOFn segment && remove DNL table
-        if sof.from == original {
-            jpg.data[sof.start + 5] = jpg.data[offset]
-            jpg.data[sof.start + 6] = jpg.data[offset+1]
-        } else {
-            jpg.update[sof.start + 5] = jpg.data[offset]
-            jpg.update[sof.start + 6] = jpg.data[offset+1]
+    nLines := uint16(jpg.data[offset]) << 8 + uint16(jpg.data[offset+1])
+    cf.resolution.dnlLines = nLines
+    var toRemove bool
+    if ( cf.resolution.nLines != 0 ) {
+        if jpg.Warn {
+            fmt.Printf( "Warning: DNL table found with non 0 SOF number " +
+                        "of lines (%d)\n", cf.resolution.nLines )
         }
-        fmt.Printf( "  FIXING: replacing number of lines in Start Of Frame (from %d to %d) and removing DNL table\n",
-                    prevLines, nLines)
-    } else {
-        if ( prevLines != 0 ) {
-            return fmt.Errorf( "defineNumberOfLines: DNL table found with non 0 SOF number of lines (%d)\n",
-                                prevLines )
+        if jpg.TidyUp {
+            toRemove = true
         }
-
-        // otherwise just add the table
-        err = jpg.addTable( marker, jpg.offset, jpg.offset + 2 + sLen, original )
     }
+    nls := new( dnlSeg )
+    nls.nLines = nLines
+    nls.toRemove = toRemove
+    jpg.addSeg( nls )
     return
 }
 
-func (jpg *JpegDesc)fixLines( ) {
+func (jpg *Desc)fixLines( ) {
 
-    // find SOFn segment, which is the last table in global tables
-    sof := jpg.getLastGlobalTable()
-    if sof == nil || sof.stop - sof.start < 8 { panic("Internal error (no Start Of Frame)\n") }
-
-    var prevLines uint
-    if sof.from == original {
-        prevLines = uint(jpg.data[sof.start + 5]) << 8 + uint(jpg.data[sof.start + 6])
-    } else {
-        prevLines = uint(jpg.update[sof.start + 5]) << 8 + uint(jpg.update[sof.start + 6])
+    frm := jpg.getCurrentFrame( )
+    if frm.encoding > HuffmanExtendedSequential {
+        fmt.Printf("Non Sequential Huffman coded frame(s): lines are left untouched\n")
+        return
     }
-
-    n := len( jpg.scans ) -1    // last scan is empty
+    n := len( frm.scans ) - 1   // always one scan ready for a possible new scan
     if n == 0 { panic("Internal error (no scan for image)\n") }
 
     nLines := uint(0)   // calculate the actual number of lines from scan results
     for i:= 0; i < n; i++ {
-        scan := &jpg.scans[i]
+        scan := &frm.scans[i]
         if nLines < scan.mcuD.sComps[0].nRows {
             nLines = scan.mcuD.sComps[0].nRows
         }
     }
-    nLines *= 8         // 8 pixel lines per data unit
-
-    // fix image resolution (metadata)
-    jpg.resolution.nLines = nLines
-
-    // fix SOFn segment
-    if sof.from == original {
-        jpg.data[sof.start + 5] = byte(nLines >> 8)
-        jpg.data[sof.start + 6] = byte(nLines&0xff)
-    } else {
-        jpg.update[sof.start + 5] = byte(nLines >> 8)
-        jpg.update[sof.start + 6] = byte(nLines&0xff)
-    }
-    fmt.Printf( "  FIXING: replacing number of lines in Start Of Frame with actual scan results (from %d to %d)\n",
-                prevLines, nLines)
-}
-
-func (jpg *JpegDesc)printMarker( marker, sLen, offset uint ) {
-    if jpg.Markers {
-        fmt.Printf( "Marker 0x%x, len %d, offset 0x%x (%s)\n", marker, sLen, offset, getJPEGmarkerName(marker) )
+    scanLines := uint16(nLines * 8) // 8 pixel lines per data unit row
+    if scanLines != frm.resolution.nLines {
+        fmt.Printf( "  FIXING: replacing number of lines in Start Of Frame " +
+                    "with actual scan results (from %d to %d)\n",
+                    frm.resolution.nLines, scanLines )
+        frm.resolution.scanLines = scanLines
     }
 }
-
-type Control struct {
-    Markers         bool    // show JPEG markers as they are parsed
-    Content         bool    // display content of JPEG segments
-    Quantizers      bool    // display quantization matrices as defined
-    Lengths         bool    // display huffman table (code length & symbols)
-    Codes           bool    // display huffman code for each symbol
-    Mcu             bool    // display MCUs as they are parsed
-    Du              bool    // display each DU resulting from MCU parsing
-    Fix             bool    // try and fix errors if possible
-    Begin, End      uint    // control MCU &DU display (from begin to end, included)
-}
-
-/*
-    Analyse analyses jpeg data and splits the data into well-known segments.
-    The argument toDo indicates what information should be printed during
-    analysis. The argument doDo.Fix, if true, indicates that some common issues
-    in jpeg data be fixed as much as possible during analysis and updated in
-    memory.
-
-    What can be fixed:
-
-    - if the last RSTn is ending a scan it is not necessary and it may cause a
-    renderer to fail. It is removed from the scan.
-
-    - if a DNL table is found after an ECS and if the number of lines given in
-    the SOFn table was 0, the number of lines found in DNL is set in the SOFn
-    and in metadata and the DNL table is removed
-
-    - if the number of lines calculated from the scan data is different from
-    the SOFn value, the SOFn value and metadata are updated (this is done after
-    DNL processing).
-
-    It returns a tuple: a pointer to a JpegDesc containing segment definitions
-    and an error. In all cases, nil error or not, the returned JpegDesc is
-    usable (but wont be complete in case of error).
-*/
-func Analyze( data []byte, toDo *Control ) ( *JpegDesc, error ) {
-
-    jpg := new( JpegDesc )   // initially in INIT state (0)
-    jpg.Control = *toDo
-    jpg.data = data
-
-    if ! bytes.Equal( data[0:2],  []byte{ 0xff, 0xd8 } ) {
-		return jpg, fmt.Errorf( "Analyze: Wrong signature 0x%x for a JPEG file\n", data[0:2] )
-	}
-
-    tLen := uint(len(data))
-makerLoop:
-    for i := uint(0); i < tLen; {
-        marker := uint(data[i]) << 8 + uint(data[i+1])
-        sLen := uint(0)       // case of a segment without any data
-
-        if marker < _TEM {
-		    return jpg, fmt.Errorf( "Analyze: invalid marker 0x%x\n", data[i:i+1] )
-        }
-
-        switch marker {
-
-        case _SOI:            // no data, no length
-            jpg.printMarker( marker, sLen, i )
-            if jpg.state != _INIT {
-		        return jpg, fmt.Errorf( "Analyze: Wrong sequence %s in state %s\n",
-                                        getJPEGmarkerName(marker), jpg.getJPEGStateName() )
-            }
-            jpg.state = _APPLICATION
-
-        case _RST0, _RST1, _RST2, _RST3, _RST4, _RST5, _RST6, _RST7: // empty segment, no following length
-            jpg.printMarker( marker, sLen, i )
-            return jpg, fmt.Errorf ("Analyze: Marker %s hould not happen in top level segments\n",
-                                     getJPEGmarkerName(marker) )
-
-        case _EOI:
-            jpg.printMarker( marker, sLen, i )
-            if jpg.state != _SCAN1 && jpg.state != _SCANn {
-		        return jpg, fmt.Errorf( "Analyze: Wrong sequence %s in state %s\n",
-                            getJPEGmarkerName(marker), jpg.getJPEGStateName() )
-            }
-            jpg.state = _FINAL
-            jpg.offset = i + 2  // points after the last byte
-            if jpg.Fix { jpg.fixLines( ) }
-            break makerLoop // exit even if there is junk at the end of the file
-
-        default:        // all other cases have data following marker & length
-            sLen = uint(data[i+2]) << 8 + uint(data[i+3])
-            jpg.printMarker( marker, sLen, i )
-            transitionToFrame := true
-            var err error
-
-            switch marker {    // second level marker switching within the first default
-            case _APP0:
-                err = jpg.app0( marker, sLen )
-                transitionToFrame = false
-            case _APP1:
-                err = jpg.app1( marker, sLen )
-                transitionToFrame = false
-
-            case _APP2, _APP3, _APP4, _APP5, _APP6, _APP7, _APP8, _APP9,
-                 _APP10, _APP11, _APP12, _APP13, _APP14, _APP15:
-                transitionToFrame = false
-
-            case _SOF0, _SOF1, _SOF2, _SOF3, _SOF5, _SOF6, _SOF7, _SOF9, _SOF10,
-                 _SOF11, _SOF13, _SOF14, _SOF15:
-                err = jpg.startOfFrame( marker, sLen )
-
-            case _DHT:  // Define Huffman Table
-                err = jpg.defineHuffmanTable( marker, sLen )
-
-            case _DQT:  // Define Quantization Table
-                err = jpg.defineQuantizationTable( marker, sLen )
-
-            case _DAC:    // Define Arithmetic coding
-                err = jpg.addTable( marker, jpg.offset, jpg.offset + 2 + sLen, original )
-
-            case _DNL:
-                err = jpg.defineNumberOfLines( marker, sLen )
-
-            case  _DRI:  // Define Restart Interval
-                err = jpg.defineRestartInterval( marker, sLen )
-
-            case _SOS:
-                err = jpg.processScan( marker, sLen )
-                if err != nil { return jpg, jpgForwardError( "Analyze", err ) }
-                i = jpg.offset          // jpg.offset has been updated
-                continue
-
-            case _COM:  // Comment
-                err = jpg.commentSegment( marker, sLen )
-
-            case _DHP, _EXP:  // Define Hierarchical Progression, Expand reference components
-                return jpg, fmt.Errorf( "Analyze: Unsupported hierarchical table %s\n",
-                                        getJPEGmarkerName(marker) )
-
-            default:    // All JPEG extensions and reserved markers (_JPG, _TEM, _RESn)
-                return jpg, fmt.Errorf( "Analyze: Unsupported JPEG extension or reserved marker%s\n",
-                                        getJPEGmarkerName(marker) )
-            }
-            if err != nil { return jpg, jpgForwardError( "Analyze", err ) }
-            if jpg.state == _APPLICATION && transitionToFrame {
-                jpg.state = _FRAME
-            }
-        }
-        i += sLen + 2
-        jpg.offset = i          // always points at the mark
-    }
-    return jpg, nil
-}
-
-/*
-    ReadJpeg reads a JPEG file in memory, and starts analysing its content.
-    The argument path is the existing file path.
-    The argument toDo provides information about how to analyse the document
-    If toDo.Fix is true, ReadJped fixes some common issues in jpeg data by
-    writing the modified data in memory, so that they can be stored later by
-    calling Write or Generate.
-
-    It returns a tuple: a pointer to a JpegDesc containing the segment
-    definitions and an error. If the file cannot be read the returned JpegDesc
-    is nil.
-*/
-func ReadJpeg( path string, toDo *Control ) ( *JpegDesc, error ) {
-    data, err := ioutil.ReadFile( path )
-    if err != nil {
-		return nil, fmt.Errorf( "ReadJpeg: Unable to read file %s: %v\n", path, err )
-	}
-    return Analyze( data, toDo )
-}
-
-// IsComplete returns true if the current JPEG data makes a complete JPEG file.
-// It does not guarantee that the data corresponds to a valid JPEG image
-func (jpg *JpegDesc) IsComplete( ) bool {
-    return jpg.state == _FINAL
-}
-
-type Metadata struct {
-    SampleSize      uint    // number of bits per pixel
-    Width, Height   uint    // image size in pixels
-}
-
-// GetMetadata returns the sample size (precision) and image size (width, height).
-func (jpg *JpegDesc)GetMetadata( ) Metadata {
-    var result Metadata
-    result.SampleSize = jpg.resolution.samplePrecision
-    result.Width = jpg.resolution.nSamplesLine
-    result.Height = jpg.resolution.nLines
-    return result
-}
-
-// GetActualLengths returns the number of bytes between SOI and EOI (both included)
-// in the possibly fixed jpeg data, and the original data length. The data length may be
-// different if the analysis stopped in error, issues have been fixed or if there is some
-// garbage at the end that should be ignored.
-func (jpg *JpegDesc) GetActualLengths( ) ( uint, uint ) {
-
-    dataSize := uint( len( jpg.data ) )
-    if ! jpg.IsComplete() { return 0, dataSize }
-    size, err := jpg.flatten( ioutil.Discard ); if err != nil { return 0, dataSize }
-    return uint(size), dataSize
-}
-
-func (jpg *JpegDesc)writeSegment( w io.Writer, s *segment ) (written int, err error) {
-    if s.from == original {
-        written, err = w.Write( jpg.data[s.start:s.stop] )
-    } else {
-        written, err = w.Write( jpg.update[s.start:s.stop] )
-    }
-    return
-}
-
-func (jpg *JpegDesc)flatten( w io.Writer ) (int, error) {
-
-    if ! jpg.IsComplete() {
-        return 0, fmt.Errorf( "flatten: data is not a complete JPEG\n" )
-    }
-    written, err := w.Write( []byte{ 0xFF, 0xD8 } )
-    if err != nil { return written, jpgForwardError( "flatten", err ) }
-
-    var n int
-    n, err = jpg.writeApps( w )
-    if err != nil { return written, jpgForwardError( "flatten", err ) }
-    written += n
-
-    for index := range( jpg.tables )  {
-        n, err = jpg.writeSegment( w, &jpg.tables[index] )
-        written += n
-        if err != nil { return  written,jpgForwardError( "flatten", err ) }
-    }
-
-    for scanIndex := range( jpg.scans ) {
-        for tableIndex := range( jpg.scans[scanIndex].tables ) {
-            n, err = jpg.writeSegment( w, &jpg.scans[scanIndex].tables[tableIndex] )
-            written += n
-            if err != nil { return written, jpgForwardError( "flatten", err ) }
-        }
-        for ECSIndex := range( jpg.scans[scanIndex].ECSs ) {
-            n, err = jpg.writeSegment( w, &jpg.scans[scanIndex].ECSs[ECSIndex] )
-            written += n
-            if err != nil { return written, jpgForwardError( "flatten", err ) }
-        }
-    }
-
-    n, err = w.Write( []byte{ 0xFF, 0xD9 } )
-    written += n
-    if err != nil { return written, jpgForwardError( "flatten", err ) }
-    return written, nil
-}
-
-// Generate returns a copy in memory of the possibly fixed jpeg file after analysis.
-func (jpg *JpegDesc) Generate( ) ( []byte, error ) {
-    var b bytes.Buffer
-    _, err := jpg.flatten( &b )
-    if  err != nil { return nil, jpgForwardError( "Generate", err ) }
-    return b.Bytes(), nil
-}
-
-// Write stores the possibly fixed JEPG data into a file.
-// The argument path is the new file path.
-// If the file exists already, new content will replace the existing one.
-func (jpg *JpegDesc)Write( path string ) (err error) {
-    if ! jpg.IsComplete() {
-        return fmt.Errorf( "Write: Data is not a complete JPEG\n" )
-    }
-
-    defer func ( ) { if err != nil { err = jpgForwardError( "Write", err ) } }()
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, os.ModePerm)
-    if err == nil {
-        defer func ( ) { if e := f.Close( ); err == nil { err = e } }()
-        _, err = jpg.flatten( f )
-    }
-    return
-}
-

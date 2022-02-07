@@ -5,65 +5,28 @@ package jpeg
 import (
     "fmt"
     "bytes"
+    "encoding/binary"
     "github.com/jrm-1535/exif"
     "io"
 )
 
-// appMetadata interface for all apps
-type appMetadata interface {
-    serialize( w io.Writer ) (int, error)
-    format( w io.Writer ) error
-    remove( id int, tag int ) error
-    parseThumbnails( ) error
+// metadata interface for all apps
+type metadata interface {
+    mFormat( w io.Writer, mid int, sids []int ) (int, error)
+    mRemove( appId int, sId []int ) error
+    mThumbnail( tid int, path string ) (int, error)
+//    mExtract( mid int,  ) (int, error)
 }
-
-type appId  uint
-const (
-    JFIF appId = iota
-    EXIF
-)
-
-type app struct {
-    id              appId
-    data            []appMetadata
-}
-
-func (jpg *JpegDesc) storeApp( id appId, data appMetadata ) {
-    for _, app := range jpg.apps {
-        if app.id == id {
-            app.data = append( app.data, data )
-            return
-        }
-    }
-    jpg.apps = append( jpg.apps, app{ id, []appMetadata{ data } } )
-}
-
-func (jpg *JpegDesc) writeApps( w io.Writer ) (written int, err error) {
-
-    defer func() { if err != nil {err = fmt.Errorf( "writeApps: %v", err )} }()
-
-    var n int
-    for _, app := range jpg.apps {
-        for _, md := range( app.data ) {
-            n, err = md.serialize( w )
-            if err != nil {
-                return
-            }
-            written += n
-        }
-    }
-    return
-}
-
 
 // app0 support
+
 const (                             // Image resolution units (prefixed with _ to avoid being documented)
     _DOTS_PER_ARBITRARY_UNIT = 0    // undefined unit
     _DOTS_PER_INCH = 1              // DPI
     _DOTS_PER_CM = 2                // DPCM Dots per centimeter
 )
 
-func getUnitsString( units int ) (string, string) {
+func getUnitsString( units uint8 ) (string, string) {
     switch units {
     case _DOTS_PER_ARBITRARY_UNIT: return "dots per abitrary unit", "dp?"
     case _DOTS_PER_INCH:           return "dots per inch", "dpi"
@@ -84,12 +47,129 @@ func markerAPP0discriminator( h5 []byte ) int {
 }
 
 const (
+    _JFIF_BASE          = 0     // code for main JFIF app segment
     _THUMBNAIL_BASELINE = 0x10
     _THUMBNAIL_PALETTE  = 0x11
     _THUMBNAIL_RGB      = 0x12
 )
 
-func (jpg *JpegDesc) app0( marker, sLen uint ) error {
+const (
+    _JFIF_FIXED_SIZE    = 16
+    _JFXX_FIXED_SIZE    = 8
+    _RGB_PIXEL_SIZE     = 3
+    _PALETTE_SIZE       = _RGB_PIXEL_SIZE*256
+)
+
+type app0   struct {
+    sType    uint8
+    major,
+    minor    uint8
+    unit     uint8
+    hDensity,
+    vDensity uint16
+    htNail,
+    vtNail   uint8
+    removed  bool
+    thbnail  []byte
+}
+
+func (a0 *app0)serialize( w io.Writer ) (int, error) {
+    if a0.removed {
+        return 0, nil
+    }
+    var seg []byte
+    switch a0.sType {
+    case _JFIF_BASE:
+        size := _JFIF_FIXED_SIZE +
+                ( _RGB_PIXEL_SIZE * int(a0.htNail) * int(a0.vtNail) )
+        seg = make( []byte, 2 + size )
+
+        binary.BigEndian.PutUint16( seg, _APP0 )
+        binary.BigEndian.PutUint16( seg[2:], uint16(size) )
+        copy( seg[4:], "JFIF\x00" )
+
+        seg[9] = a0.major
+        seg[10] = a0.minor
+        seg[11] = a0.unit
+
+        binary.BigEndian.PutUint16(seg[12:], a0.hDensity)
+        binary.BigEndian.PutUint16(seg[14:], a0.vDensity)
+        seg[16] = a0.htNail
+        seg[17] = a0.vtNail
+
+        copy( seg[18:], a0.thbnail )
+
+    case _THUMBNAIL_BASELINE:
+        size := _JFXX_FIXED_SIZE + len(a0.thbnail)
+        seg = make( []byte, 2 + size )
+
+        binary.BigEndian.PutUint16( seg, _APP0 )
+        binary.BigEndian.PutUint16( seg[2:], uint16(size) )
+        copy( seg[4:], "JFXX\x00" )
+
+        seg[9] = a0.sType
+        copy( seg[10:], a0.thbnail )
+
+    case _THUMBNAIL_PALETTE, _THUMBNAIL_RGB:
+        size := _JFXX_FIXED_SIZE + 2 + len(a0.thbnail)
+        seg = make( []byte, 2 + size )
+
+        binary.BigEndian.PutUint16( seg, _APP0 )
+        binary.BigEndian.PutUint16( seg[2:], uint16(size) )
+        copy( seg[4:], "JFXX\x00" )
+
+        seg[9] = a0.sType
+        seg[10] = a0.htNail
+        seg[11] = a0.vtNail
+        copy( seg[12:], a0.thbnail )
+    }
+    return w.Write( seg )
+}
+
+func (a0 *app0)commonFormat( w io.Writer ) (int, error) {
+    cw := newCumulativeWriter( w )
+    switch a0.sType {
+    case _THUMBNAIL_BASELINE:
+        cw.format( "APP0  Extension:\n  Thumbnail coded using JPEG\n" )
+    case _THUMBNAIL_PALETTE:
+        cw.format( "APP0  Extension:\n  Thumbnail coded using 8-bit Palette\n" )
+    case _THUMBNAIL_RGB:
+        cw.format( "APP0  Extension:\n  Thumbnail coded using uncompressed 24-bit RGB\n" )
+    case _JFIF_BASE:
+        cw.format( "APP0:\n  JFIF Version %d.%02d\n", a0.major, a0.minor )
+        units, symb := getUnitsString( a0.unit )
+        cw.format( "  density in %s (%s)\n", units, symb )
+        cw.format( "  density %d,%d %s\n", a0.hDensity, a0.vDensity, symb )
+        cw.format( "  thumbnail %d,%d pixels\n", a0.htNail, a0.vtNail )
+    default:
+        panic("format app0: not a valid app\n")
+    }
+    return cw.result()
+}
+func (a0 *app0)format( w io.Writer ) (int, error) {
+    return a0.commonFormat( w )
+}
+
+func (a0 *app0)mFormat( w io.Writer, appId int, sIds []int ) (int, error) {
+    if appId == 0 {
+        return a0.commonFormat( w )
+    }
+    return 0, nil
+}
+
+func (a0 *app0)mRemove( appId int, sId []int ) (err error) {
+    if appId != 1 {
+        return
+    }
+    a0.removed = true
+    return
+}
+
+func (a0 *app0)mThumbnail( tid int, path string ) (n int, err error) {
+    return
+}
+
+func (jpg *Desc) app0( marker, sLen uint ) error {
     if sLen < 8 {
         return fmt.Errorf( "app0: Wrong APP0 (JFIF) header (invalid length %d)\n", sLen )
     }
@@ -103,65 +183,65 @@ func (jpg *JpegDesc) app0( marker, sLen uint ) error {
         return fmt.Errorf( "app0: Wrong APP0 header (%s)\n", jpg.data[offset:offset+4] )
     }
 
-    if jpg.Content {
-        fmt.Printf( "APP0\n" )
-    }
-    var err error
     if appType == _APP0_JFIF {
-        if len(jpg.tables) != 0 {
-            return fmt.Errorf( "app0: APP0 (JFIF) is not the first segment\n" )
+        if len(jpg.segments) != 0 {
+            return fmt.Errorf( "app0: JFIF is not the first segment\n" )
         }
         if sLen < 16 {
-            return fmt.Errorf( "app0: Wrong APP0 (JFIF) header (invalid length %d)\n", sLen )
+            return fmt.Errorf( "app0: Wrong JFIF header (invalid length %d)\n", sLen )
+        }
+        htNail := jpg.data[offset+12]
+        vtNail := jpg.data[offset+13]
+        thbnSize := _RGB_PIXEL_SIZE * uint(htNail) * uint(vtNail)
+        if sLen != _JFIF_FIXED_SIZE + thbnSize {
+            return fmt.Errorf( "app0: Wrong JFIF header (incorrect len %d)\n", sLen )
         }
 
-        HtNail := uint( jpg.data[offset+12] )
-        VtNail := uint( jpg.data[offset+13] )
-        if jpg.Content {
-            major := uint( jpg.data[offset+5] )  // 0x01
-            minor := uint( jpg.data[offset+6] )  // 0x02
-            fmt.Printf( "  JFIF Version %d.%02d\n", major, minor )
-
-            unitCode := int( jpg.data[offset+7] )
-            units, symb := getUnitsString( unitCode )
-            fmt.Printf( "  size in %s (%s)\n", units, symb )
-
-            Hdensity := uint( jpg.data[offset+8] ) << 8 + uint( jpg.data[offset+9] )
-            Vdensity := uint( jpg.data[offset+10] ) << 8 + uint( jpg.data[offset+11] )
-            fmt.Printf( "  density %d,%d %s\n", Hdensity, Vdensity, symb )
-            fmt.Printf( "  thumbnail %d,%d pixels\n", HtNail, VtNail )
+        a := new(app0)
+        a.sType = _JFIF_BASE
+        a.htNail = htNail
+        a.vtNail = vtNail
+        a.major = jpg.data[offset+5]    // 0x01
+        a.minor = jpg.data[offset+6]    // 0x02
+        a.unit = jpg.data[offset+7]
+        a.hDensity = uint16( jpg.data[offset+8] ) << 8 + uint16( jpg.data[offset+9] )
+        a.vDensity = uint16( jpg.data[offset+10] ) << 8 + uint16( jpg.data[offset+11] )
+        if thbnSize != 0 {
+            a.thbnail = make( []byte, thbnSize )
+            copy( a.thbnail, jpg.data[offset+14:] )
         }
-        if sLen != 16 + HtNail * VtNail {
-            return fmt.Errorf( "app0: Wrong APP0 (JFIF) header (len %d)\n", sLen )
-        }
-
-        err = jpg.addTable( marker, jpg.offset, jpg.offset + 2 + sLen, original )
-
+        jpg.addSeg( a )
+//        jpg.addApp( a )
     } else {
-        if len(jpg.tables) != 1 {
-            return fmt.Errorf( "app0: APP0 extension does not follow APP0 (JFIF)\n" )
+        if len(jpg.segments) != 1 {
+            return fmt.Errorf( "app0: JFIF extension does not follow JFIF\n" )
         }
         if jpg.app0Extension {
-            return fmt.Errorf( "app0: Multiple APP0 extensions\n" )
+            return fmt.Errorf( "app0: Multiple JFIF extensions\n" )
         }
-        if jpg.Content {
-            fmt.Printf( "  JFIF extension\n" )
-            extCode := uint( jpg.data[offset+5] )
-            switch extCode {
-            default:
-                return fmt.Errorf( "app0: Wrong JFIF extention code (thumbnail) (code 0x%02d)\n", extCode )
-            case _THUMBNAIL_BASELINE:    // ignore for now
-                fmt.Printf( "  Thumbnail encoded according to ITU-T T.81 | ISO/IEC 10918-1 baseline process\n" )
-            case _THUMBNAIL_PALETTE:     // ignore for now
-                fmt.Printf( "  Thumbnail encoded as 1 byte per pixel in 256 entry RGB palette\n" )
-            case _THUMBNAIL_RGB:         // ignore for now
-                fmt.Printf( "  Thumbnail encoded as RGB (3 bytes per pixel)\n" )
-            }
+
+        a := new(app0)
+        a.sType = jpg.data[offset+5]
+        switch a.sType {
+        case _THUMBNAIL_BASELINE:
+            a.thbnail = make( []byte, sLen - 8 )   // Thumbnail JPEG file
+            copy( a.thbnail, jpg.data[offset+6:] )
+        case _THUMBNAIL_PALETTE:
+            a.htNail = jpg.data[offset+6]
+            a.vtNail = jpg.data[offset+7]
+            thbnSize := _PALETTE_SIZE + (uint(a.htNail) * uint(a.vtNail))
+            a.thbnail = make( []byte, thbnSize )
+            copy( a.thbnail, jpg.data[offset+8:] )
+        case _THUMBNAIL_RGB:
+            a.htNail = jpg.data[offset+6]
+            a.vtNail = jpg.data[offset+7]
+            thbnSize := _RGB_PIXEL_SIZE * uint(a.htNail) * uint(a.vtNail)
+            a.thbnail = make( []byte, thbnSize )
+            copy( a.thbnail, jpg.data[offset+8:] )
         }
         jpg.app0Extension = true
-        err = jpg.addTable( marker, jpg.offset, jpg.offset + 2 + sLen, original )
+        jpg.addSeg( a )
     }
-    if err != nil { return jpgForwardError( "app0", err ) }
     return nil
 }
 
@@ -172,32 +252,101 @@ const (
     _APP1_XMP
 )
 
-func (jpg *JpegDesc) xmpApplication( offset, sLen uint ) error {
-    if jpg.Content {
-        fmt.Printf( "APP1 (XMP)\n" )
-        fmt.Printf( "  ----------------- Length %d -----------------\n", sLen )
+func (jpg *Desc) xmpApplication( offset, sLen uint ) error {
+/*
+    fmt.Printf( "APP1 (XMP)\n" )
+    fmt.Printf( "  ----------------- Length %d -----------------\n", sLen )
 // TODO: format XML
-        fmt.Printf( "%s\n", string(jpg.data[jpg.offset+33:jpg.offset+4+sLen]) )
-        fmt.Printf( "  --------------------------------------------------\n" )
-    }
+    fmt.Printf( "%s\n", string(jpg.data[jpg.offset+33:jpg.offset+4+sLen]) )
+    fmt.Printf( "  --------------------------------------------------\n" )
+*/
     return nil
 }
 
 type exifData struct {
+    removed bool
     desc *exif.Desc
 }
 
-func (ed *exifData) serialize( w io.Writer) (int, error) {
-    return ed.desc.Serialize( w )
+func (ed *exifData) serialize( w io.Writer) (n int, err error) {
+    if ed.removed {
+        return
+    }
+    var sz int
+    if sz, err = ed.desc.Serialize( io.Discard ); err != nil {
+        return
+    }
+    seg := make( []byte, 4 )
+    binary.BigEndian.PutUint16( seg, _APP1 )
+    binary.BigEndian.PutUint16( seg[2:], uint16(sz+2) )
+
+    cw := newCumulativeWriter( w )
+    cw.Write( seg )
+    ed.desc.Serialize( cw )
+    n, err = cw.result()
+    return
 }
 
-func (ed *exifData) format( w io.Writer) error {
-    return ed.desc.Format( w )
+func (ed *exifData)format( w io.Writer) (n int, err error) {
+    cw := newCumulativeWriter( w )
+    ed.desc.Format( cw )
+    n, err = cw.result()
+    if err != nil { err = fmt.Errorf( "format: %w", err ) }
+    return
 }
 
-func (ed *exifData) remove( id int, tag int ) error {
-    return ed.desc.Remove( exif.IfdId(id), tag )
+func (ed *exifData)mFormat( w io.Writer, appId int, sIds []int ) (int, error) {
+    if appId == 1 {
+        if len(sIds) == 0 {
+            // FIXME: modify exif Format to return also n written bytes
+            return 1, ed.desc.Format( w )
+        }
+        args := make( []exif.IfdId, len(sIds) )
+        for i, sId := range sIds {
+            args[i] = exif.IfdId(sId)
+        }
+        // FIXME: modify exif FormatIfds to return also n written bytes
+        return 1, ed.desc.FormatIfds( w, args /*[]exif.IfdId(sIds)*/ )
+    }
+    return 0, nil
 }
+
+func (ed *exifData)mRemove( appId int, sId []int ) (err error) {
+    if appId != 1 {
+        return
+    }
+    if len(sId) == 0 {
+        ed.removed = true
+        return
+    }
+    for _, id := range sId {
+        if id == 0 {
+            ed.removed = true
+            break
+        } else {
+            err = ed.desc.Remove( exif.IfdId(id), -1 )
+            if err != nil {
+                break
+            }
+        }
+    }
+    return
+}
+
+func (ed *exifData) mThumbnail( tid int, path string ) (n int, err error) {
+    var from exif.IfdId
+    if tid == 0 {
+        from = exif.THUMBNAIL
+    } else if tid == 1 {
+        from = exif.EMBEDDED
+    } else {
+        err = fmt.Errorf( "mThumbnail: invalid thumbnail id: %d\n", tid )
+        return
+    }
+    n, err = ed.desc.WriteThumbnail( path, from )
+    return
+}
+
 
 func (ed *exifData)parseThumbnails( ) (err error) {
 
@@ -220,7 +369,7 @@ func (ed *exifData)parseThumbnails( ) (err error) {
             }
             fmt.Printf( "============= Thumbnail JPEG picture ================\n" )
             toClose = true
-            _, err = Analyze( data, &Control{ Markers: true, Content: true } )
+            _, err = Parse( data, &Control{ Markers: true } )
             if err != nil {
                 return
             }
@@ -232,21 +381,17 @@ func (ed *exifData)parseThumbnails( ) (err error) {
     return nil
 }
 
-func (jpg *JpegDesc) exifApplication( offset, sLen uint ) error {
+func (jpg *Desc) exifApplication( offset, sLen uint ) error {
     ec := exif.Control{ Unknown: exif.KeepTag, Warn: true }
     d, err := exif.Parse( jpg.data, offset, sLen, &ec )
 
     if err == nil {
-        ed := new( exifData )
+        ed := new(exifData)
         ed.desc = d
-        jpg.storeApp( EXIF, ed )
+        jpg.addSeg( ed )
 
-        if jpg.Content {
-
+        if jpg.Recurse {
             if err = ed.parseThumbnails(); err != nil {
-                return fmt.Errorf( "exifApplication: %v", err )
-            }
-            if err = d.Format( nil ); err != nil {
                 return fmt.Errorf( "exifApplication: %v", err )
             }
         }
@@ -264,7 +409,7 @@ func markerAPP1discriminator( header []byte ) int {
     return -1
 }
 
-func (jpg *JpegDesc) app1( marker, sLen uint ) error {
+func (jpg *Desc) app1( marker, sLen uint ) error {
     if sLen < 8 {
         return fmt.Errorf( "app1: Wrong APP1 (EXIF, TIFF) header (invalid length %d)\n", sLen )
     }
@@ -282,11 +427,6 @@ func (jpg *JpegDesc) app1( marker, sLen uint ) error {
         err = jpg.xmpApplication( offset, sLen-2 )
     default:
         err = fmt.Errorf( "app1: Wrong APP1 header (%s)\n", jpg.data[offset:offset+6] )
-    }
-
-    if err == nil {
-        return nil
-//        return jpg.addTable( marker, jpg.offset, jpg.offset + 2 + sLen, original )
     }
     return err
 }
