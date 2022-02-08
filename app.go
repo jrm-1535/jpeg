@@ -298,15 +298,13 @@ func (ed *exifData)format( w io.Writer) (n int, err error) {
 func (ed *exifData)mFormat( w io.Writer, appId int, sIds []int ) (int, error) {
     if appId == 1 {
         if len(sIds) == 0 {
-            // FIXME: modify exif Format to return also n written bytes
-            return 1, ed.desc.Format( w )
+            return ed.desc.Format( w )
         }
         args := make( []exif.IfdId, len(sIds) )
         for i, sId := range sIds {
             args[i] = exif.IfdId(sId)
         }
-        // FIXME: modify exif FormatIfds to return also n written bytes
-        return 1, ed.desc.FormatIfds( w, args /*[]exif.IfdId(sIds)*/ )
+        return ed.desc.FormatIfds( w, args )
     }
     return 0, nil
 }
