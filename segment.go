@@ -715,7 +715,7 @@ func (jpg *Desc)defineQuantizationTable( marker, sLen uint ) ( err error ) {
     qtn := int(0)
     qts := new( qtSeg )
 
-    for ; ; qtn++ { // Mutiple QTs can be combined in a single DQT segment
+    for ; ; { // Mutiple QTs can be combined in a single DQT segment
         pq := uint(jpg.data[offset]) >> 4 // Quantization table element precision
 // 0 => 8-bit values; 1 => 16-bit values. Shall be 0 for 8-bit sample precision.
         tq := uint(jpg.data[offset]) & 0x0f // Quantization table destination id
@@ -742,6 +742,7 @@ func (jpg *Desc)defineQuantizationTable( marker, sLen uint ) ( err error ) {
             }
             qts.data[qtn][i+1] = jpg.qdefs[tq].values[i]
         }
+        qtn++
         if offset >= end {
             break
         }

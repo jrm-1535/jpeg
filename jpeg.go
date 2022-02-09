@@ -724,7 +724,8 @@ func (jpg *Desc) IsComplete( ) bool {
 }
 
 // GetNumberOfFrames returns the number of frames in the file, which can be 0
-// (most common case), or more in case of hierarchical frames.
+// (no frame or parsing ended up in error), 1(most common case), or more in
+// case of hierarchical frames.
 func (jpg *Desc) GetNumberOfFrames( ) uint {
     return uint(len(jpg.frames))
 }
