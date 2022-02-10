@@ -73,7 +73,7 @@ type scanCompRef struct {      // scan component reference
     cmId, dcId, acId uint8
 }
 
-func (jpg *Desc) newMcuDesc( sComp *[]scanCompRef ) *mcuDesc {
+func (jpg *Desc) newMcuDesc( sComp *[]scanCompRef ) (*mcuDesc, error) {
 
     mcu := new(mcuDesc)
     mcu.sComps = make( []scanComp, len(*sComp) )
@@ -83,6 +83,11 @@ func (jpg *Desc) newMcuDesc( sComp *[]scanCompRef ) *mcuDesc {
 
     frm := jpg.getCurrentFrame()
     for i, sc := range( *sComp ) {
+        qsz := uint8(jpg.qdefs[frm.components[i].QS].size)
+        if qsz == 0 {
+            return nil, fmt.Errorf( "Missing Quantization table %d for scan\n",
+                                    frm.components[i].QS )
+        }
         cmp := frm.components[i]                        // ignore sc.cmId (order is fixed)
         mcu.sComps[i].hDC = jpg.hdefs[2*sc.dcId].root   // AC follows DC
         mcu.sComps[i].hAC = jpg.hdefs[2*sc.dcId+1].root // (2 tables per dest)
@@ -105,9 +110,9 @@ func (jpg *Desc) newMcuDesc( sComp *[]scanCompRef ) *mcuDesc {
         mcu.sComps[i].dcId = sc.dcId
         mcu.sComps[i].acId = sc.acId
         mcu.sComps[i].quId = frm.components[i].QS
-        mcu.sComps[i].quSz = uint8(jpg.qdefs[frm.components[i].QS].size)
+        mcu.sComps[i].quSz = qsz
     }
-    return mcu      // initially count is 0
+    return mcu, nil
 }
 
 func subsamplingFormat( sc *scan ) string {
@@ -227,14 +232,7 @@ func (f *frame)nLines( ) uint {
     return uint(f.resolution.nLines)
 }
 
-func (f *frame)serialize( w io.Writer ) (int, error) {
-
-    lf := uint16((len(f.components) * frameComponentSpecSize) + fixedFrameHeaderSize)
-    seg := make( []byte, lf + 2 )
-    binary.BigEndian.PutUint16( seg[0:], uint16(f.encoding)+_SOF0 )
-    binary.BigEndian.PutUint16( seg[2:], lf )
-    seg[4] = byte(f.resolution.samplePrecision)
-    var nLines uint16
+func (f *frame)actualLines( ) (nLines uint16) {
     if f.resolution.scanLines != 0 {
         nLines = f.resolution.scanLines
     } else if f.resolution.dnlLines != 0 {
@@ -242,7 +240,18 @@ func (f *frame)serialize( w io.Writer ) (int, error) {
     } else {
         nLines = f.resolution.nLines
     }
-    binary.BigEndian.PutUint16( seg[5:], nLines )
+    return
+}
+
+func (f *frame)serialize( w io.Writer ) (int, error) {
+
+    lf := uint16((len(f.components) * frameComponentSpecSize) + fixedFrameHeaderSize)
+    seg := make( []byte, lf + 2 )
+    binary.BigEndian.PutUint16( seg[0:], uint16(f.encoding)+_SOF0 )
+    binary.BigEndian.PutUint16( seg[2:], lf )
+    seg[4] = byte(f.resolution.samplePrecision)
+
+    binary.BigEndian.PutUint16( seg[5:], f.actualLines() )
     binary.BigEndian.PutUint16( seg[7:], f.resolution.nSamplesLine )
     seg[9] = byte(len(f.components))
 
@@ -264,7 +273,7 @@ func (f *frame)format( w io.Writer ) (n int, err error) {
     nSamples := f.resolution.nSamplesLine
     cw.format( "    Lines: %d, Samples/Line: %d," +
                " sample precision: %d-bit, components: %d\n",
-               f.resolution.nLines, nSamples,
+               f.actualLines(), nSamples,
                f.resolution.samplePrecision, len( f.components ) )
     if ( nSamples % 8) != 0 {
         cw.format( "    Warning: Samples/Line (%d) is not a multiple of 8\n",
@@ -432,7 +441,7 @@ func (s *scan)format( w io.Writer ) (n int, err error) {
     return
 }
 
-func (jpg *Desc) processScanHeader( sLen uint ) (*scan, error) {
+func (jpg *Desc) processScanHeader( sLen uint ) (scan *scan, err error) {
 
     offset := jpg.offset + markerLengthSize
     nComponents := uint(jpg.data[offset])
@@ -453,11 +462,12 @@ func (jpg *Desc) processScanHeader( sLen uint ) (*scan, error) {
         offset += scanComponentSpecSize
     }
 
-    scan := jpg.getCurrentScan()
+    scan = jpg.getCurrentScan()
     if scan == nil { panic("processScanHeader: scan not allocated\n") }
+    if scan.mcuD, err = jpg.newMcuDesc( &sCs ); err != nil {
+        return
+    }
     scan.rstInterval = jpg.nMcuRST
-    scan.mcuD = jpg.newMcuDesc( &sCs )
-
     scan.startSS = jpg.data[offset]
     scan.endSS = jpg.data[offset+1]
     sABP := jpg.data[offset+2]

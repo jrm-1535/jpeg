@@ -45,7 +45,7 @@ func (j *Desc)GetFrameInfo( frame int ) (*FrameInfo, error) {
     fi.Entropy = frm.entropyCoding( )
     fi.SampleSize = frm.samplePrecision( )
     fi.Width = frm.nSamplesLine( )
-    fi.Height = frm.nLines( )
+    fi.Height = uint(frm.actualLines( ))
 
     fi.Components = make( []Component, len(frm.components) )
     copy( fi.Components, frm.components )
