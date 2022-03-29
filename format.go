@@ -418,3 +418,43 @@ func (j *Desc)FormatMetadata( w io.Writer, appId int, sIds []int ) (n int, err e
     return
 }
 
+func (j *Desc)FormatFrameComponent( w io.Writer,
+                                    frame, comp uint ) (n int, err error) {
+    frs := j.getFrameSegment( frame )
+    if frs == nil {
+        return 0, fmt.Errorf( "FormatFrameComponent: frame %d is absent\n",
+                              frame )
+    }
+    if len(frs.scans) != 2 {    // 1 more than actually in use
+        return 0, fmt.Errorf( "FormatFrameComponent: only 1 scan is supported\n" )
+    }
+
+    scan := frs.scans[0]
+    mcu := scan.mcuD
+    if comp >= uint(len(mcu.sComps)) {
+        return 0, fmt.Errorf( "FormatFrameComponent: component %d not available\n",
+                              comp )
+    }
+    sc := mcu.sComps[comp]
+    cw := newCumulativeWriter( w )
+    cw.format( "Frame %d, Component %d: %d rows of %d data units\n",
+               frame, comp, len(sc.iDCTdata), len(sc.iDCTdata[0]) );
+    n, err = cw.result()
+/*
+    var du = dataUnit{
+        -416,  -33,  -60,   32,   48,  -40,     0,     0,
+           0,  -24,  -56,   19,   26,    0,     0,     0,
+         -42,   13,   80,  -24,  -40,    0,     0,     0,
+         -42,   17,   44,  -29,    0,    0,     0,     0,
+          18,    0,    0,    0,    0,    0,     0,     0,
+           0,    0,    0,    0,    0,    0,     0,     0,
+           0,    0,    0,    0,    0,    0,     0,     0,
+           0,    0,    0,    0,    0,    0,     0,     0 }
+    fmt.Printf("Source:\n%v\n", du )
+    array := make( []uint8, 64 )
+    inverseDCT8( &du, array, 8 )
+    fmt.Printf("Inverse:\n%v\n", array )
+*/
+    return
+}
+

@@ -379,6 +379,68 @@ func (ed *exifData)parseThumbnails( ) (err error) {
     return nil
 }
 
+func (jpg *Desc) setTiffOrientation( ed *exifData ) {
+    const tiffOrientation = 0x112
+
+    if jpg.orientation != nil {
+        if jpg.orientation.AppSource == 1 {
+            return  // keep previous orientation
+        }
+    }
+    d := ed.desc
+    st, v, err := d.GetIfdTagValue( exif.PRIMARY, tiffOrientation )
+    if err != nil {
+        return      // no ifd?
+    }
+    if st != exif.U16Slice {
+        return      // not usable
+    }
+    slu16 := v.([]uint16)
+    if len(slu16) != 1 {
+        return
+    }
+    ocode := slu16[0]
+    orientation := new(Orientation)
+    switch ocode {
+    default:
+        return
+    case 1:
+        orientation.Row0 = Top
+        orientation.Col0 = Left
+        orientation.Effect = None
+    case 2:
+        orientation.Row0 = Top
+        orientation.Col0 = Right
+        orientation.Effect = VerticalMirror
+    case 3:
+        orientation.Row0 = Bottom
+        orientation.Col0 = Right
+        orientation.Effect = Rotate180
+    case 4:
+        orientation.Row0 = Bottom
+        orientation.Col0 = Left
+        orientation.Effect = HorizontalMirror
+    case 5:
+        orientation.Row0 = Left
+        orientation.Col0 = Top
+        orientation.Effect = HorizontalMirrorRotate90
+    case 6:
+        orientation.Row0 = Right
+        orientation.Col0 = Top
+        orientation.Effect = Rotate90
+    case 7:
+        orientation.Row0 = Right
+        orientation.Col0 = Bottom
+        orientation.Effect = VerticalMirrorRotate90
+    case 8:
+        orientation.Row0 = Left
+        orientation.Col0 = Bottom
+        orientation.Effect = Rotate270
+    }
+    orientation.AppSource = 1
+    jpg.orientation = orientation
+}
+
 func (jpg *Desc) exifApplication( offset, sLen uint ) error {
     ec := exif.Control{ Unknown: exif.KeepTag, Warn: true }
     d, err := exif.Parse( jpg.data, offset, sLen, &ec )
@@ -387,6 +449,7 @@ func (jpg *Desc) exifApplication( offset, sLen uint ) error {
         ed := new(exifData)
         ed.desc = d
         jpg.addSeg( ed )
+        jpg.setTiffOrientation( ed )
 
         if jpg.Recurse {
             if err = ed.parseThumbnails(); err != nil {

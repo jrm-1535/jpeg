@@ -52,6 +52,7 @@ import (
     hDC, hAC        *hcnode     // huffman roots for DC and AC coefficients
                                 // use hDC for 1st sample, hAC for all others
     dUnits          [][64]int   // up to vSF rows of hSF data units (64 int)
+    iDCTdata        []iDCTRow   // rows of reordered idata unit before iDCT
     previousDC      int         // previous DC value for this component
     nUnitsRow       uint        // n units per row = nSamplesLines/8
     hSF, vSF        uint        // horizontal & vertical sampling factors
@@ -59,7 +60,11 @@ import (
     dURow           uint        // increments with each row till it reaches vSF
     dUAnchor        uint        // top-left corner of dUnits area, incremented
                                 // by hSF each time hSF*vSF data units are done
+    nRows           uint        // number of rows already processed
     count           uint8       // current sample count [0-63] in each data unit
+    cId             uint8       // component id from _SOS
+    dcId, acId      uint8       // entropy table ids for DC & AC coefficients
+    quId, quSz      uint8       // quantization table id and size
 
     However, DC and AC samples are preprocessed and in particular AC samples
     are runlength compressed before entropy compression: a single preprocessed
@@ -73,7 +78,7 @@ type scanCompRef struct {      // scan component reference
     cmId, dcId, acId uint8
 }
 
-func (jpg *Desc) newMcuDesc( sComp *[]scanCompRef ) (*mcuDesc, error) {
+func (jpg *Desc) newMcuDesc( s *scan, sComp *[]scanCompRef ) (*mcuDesc, error) {
 
     mcu := new(mcuDesc)
     mcu.sComps = make( []scanComp, len(*sComp) )
@@ -89,22 +94,35 @@ func (jpg *Desc) newMcuDesc( sComp *[]scanCompRef ) (*mcuDesc, error) {
                                     frm.components[i].QS )
         }
         cmp := frm.components[i]                        // ignore sc.cmId (order is fixed)
+        fmt.Printf( "Component %d HSF %d VSF %d\n", i, cmp.HSF, cmp.VSF )
         mcu.sComps[i].hDC = jpg.hdefs[2*sc.dcId].root   // AC follows DC
-        mcu.sComps[i].hAC = jpg.hdefs[2*sc.dcId+1].root // (2 tables per dest)
+        if s.startSS == 0 && mcu.sComps[i].hDC == nil {
+            return nil, fmt.Errorf( "Missing Huffman table %d for DC scan (component %d)\n",
+                                    sc.dcId, i )
+        }
+        mcu.sComps[i].hAC = jpg.hdefs[2*sc.acId+1].root // (2 tables per dest)
+        if s.endSS > 0 && mcu.sComps[i].hAC == nil {
+            return nil, fmt.Errorf( "Missing Huffman table %d for AC scan (component %d)\n",
+                                    sc.acId, i )
+        }
         nUnitsRow := (uint(frm.resolution.nSamplesLine) / uint(frm.resolution.mhSF)) *
                       uint(cmp.HSF)
+        fmt.Printf( "nSamplesLine %d, mhSF %d, component %d HSF %d, nUnitsROw before adj %d\n",
+                    frm.resolution.nSamplesLine, frm.resolution.mhSF, i, cmp.HSF, nUnitsRow )
         if nUnitsRow % 8 != 0 { nUnitsRow += 7 }        // round up to next unit
-
         nUnitsRow /= 8
+
         nUnitsRstInt := jpg.nMcuRST * uint(cmp.HSF)
+        fmt.Printf( "nUnitsRow after rounding %d, nUintsRstInt %d\n", nUnitsRow, nUnitsRstInt )
         if nUnitsRstInt > nUnitsRow {
             nUnitsRow = nUnitsRstInt
         }
+        fmt.Printf( "Component %d nUnitsRow %d\n", i, nUnitsRow )
         mcu.sComps[i].nUnitsRow = nUnitsRow
         mcu.sComps[i].hSF = uint(cmp.HSF)
         mcu.sComps[i].vSF = uint(cmp.VSF)
-        // preallocate vSF * nUnitsLine for this component
-        mcu.sComps[i].dUnits = make( [][64]int, uint(cmp.VSF) * nUnitsRow )
+        // preallocate vSF * nUnitsRow data units for this component
+        mcu.sComps[i].dUnits = make( []dataUnit, uint(cmp.VSF) * nUnitsRow )
         // previousDC, dUCol, dURow, dUAnchor, nRows, count are set to 0
         mcu.sComps[i].cId = sc.cmId
         mcu.sComps[i].dcId = sc.dcId
@@ -452,7 +470,7 @@ func (jpg *Desc) processScanHeader( sLen uint ) (scan *scan, err error) {
             "processScanHeader: Wrong SOS header (len %d for %d components)\n",
             sLen, nComponents )
     }
-
+    fmt.Printf( "n Components %d\n", nComponents )
     sCs := make( []scanCompRef, nComponents )
     for i := uint(0); i < nComponents; i++ {
         sCs[i].cmId = jpg.data[offset]
@@ -460,13 +478,12 @@ func (jpg *Desc) processScanHeader( sLen uint ) (scan *scan, err error) {
         sCs[i].dcId = eIDs >> 4
         sCs[i].acId = eIDs & 0x0f
         offset += scanComponentSpecSize
+        fmt.Printf( "Huffman DC Id: %d, AC Id %d\n", sCs[i].dcId, sCs[i].acId )
     }
 
     scan = jpg.getCurrentScan()
     if scan == nil { panic("processScanHeader: scan not allocated\n") }
-    if scan.mcuD, err = jpg.newMcuDesc( &sCs ); err != nil {
-        return
-    }
+
     scan.rstInterval = jpg.nMcuRST
     scan.startSS = jpg.data[offset]
     scan.endSS = jpg.data[offset+1]
@@ -474,7 +491,11 @@ func (jpg *Desc) processScanHeader( sLen uint ) (scan *scan, err error) {
     scan.sABPh = sABP >> 4
     scan.sABPl = sABP & 0x0f
 
-    return scan, nil
+    fmt.Printf( "Spectral Selection start: %d, end: %d\n", scan.startSS, scan.endSS )
+    fmt.Printf( "Sucessive Approximation Ah: %d, Al: %d\n", scan.sABPh, scan.sABPl )
+
+    scan.mcuD, err = jpg.newMcuDesc( scan, &sCs );
+    return
 }
 
 func (jpg *Desc) processScan( marker, sLen uint ) error {
@@ -548,6 +569,10 @@ func (jpg *Desc) processScan( marker, sLen uint ) error {
     sc.ECSs = jpg.data[firstECS:nIx]
     sc.nMcus = nMCUs
     sc.rstCount = rstCount
+    if err = jpg.dequantize( sc ); err != nil {
+        return err
+    }
+
     frm := jpg.getCurrentFrame( )
     frm.scans = append( frm.scans, scan{ } )    // ready for next scan
     jpg.state = _SCANn
@@ -982,7 +1007,7 @@ func (jpg *Desc)defineHuffmanTable( marker, sLen uint ) ( err error ) {
 
     hts := new( htSeg )
     ht := 0
-    for ; ; ht++ {
+    for ; ; {
         tc := uint(jpg.data[offset]) >> 4
         th := uint(jpg.data[offset]) & 0x0f
 
@@ -1009,7 +1034,8 @@ func (jpg *Desc)defineHuffmanTable( marker, sLen uint ) ( err error ) {
             voffset += li
         }
         jpg.hdefs[td].root = buildTree( jpg.hdefs[td].values )
-
+        fmt.Printf("Huffman table class %d dest %d defined\n", tc, th )
+        ht++
         offset = voffset;
         if offset >= end {
             break
