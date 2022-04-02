@@ -8,6 +8,7 @@ import (
     "bytes"
     "os"
     "bufio"
+//    "time"
 )
 
 /*  ISO/IEC 10918-1:1993 defines JPEG document structure:
@@ -833,17 +834,98 @@ func (jpg *Desc) MakeFrameRawPicture( frame int ) ([](*[]uint8), error) {
 
 const writeBufferSize = 1048576
 func (jpg *Desc) writeBW( f *os.File, samples [](*[]uint8), sComps []scanComp,
-                          o *Orientation ) (nr, nc uint, n int, err error) {
+                          o *Orientation ) (nc, nr uint, n int, err error) {
 
-    gs := samples[0]
+    Y := samples[0]
+    yStride := sComps[0].nUnitsRow << 3
+
     bw := bufio.NewWriterSize( f, writeBufferSize )
     cbw := newCumulativeWriter( bw )
-    // FIXME: take orientation in account
-    nc = sComps[0].nUnitsRow << 3 
-    nr = uint(len(*gs)) / nc
-    for _, s := range *gs {
-        cbw.Write( []byte{ s, s, s} ) // RGB = YYY
+
+    writeBW := func( r, c uint ) {
+        ys  := (*Y)[r*yStride+c]
+        cbw.Write( []byte{ ys, ys, ys } )
     }
+
+    var writeOrientedBW func()
+    dLen  := uint(len(*Y))
+    nRows := dLen / yStride
+
+    if o == nil || (o.Row0 == Top && o.Col0 == Left ) { // default orientation
+        nr = nRows
+        nc = yStride
+        writeOrientedBW = func() {
+            for i := uint(0); i < dLen; i++ {
+                writeBW( i / yStride, i % yStride )
+            }
+        }
+    } else if o.Row0 == Top && o.Col0 == Right {
+        nr = nRows
+        nc = yStride
+        cStart := yStride - 1
+        writeOrientedBW = func () {
+            for i := uint(0);i < dLen; i++ {
+                writeBW( i / yStride, cStart - (i % yStride) )
+            }
+        }
+    } else if o.Row0 == Right && o.Col0 == Top {        // rotation +90
+        nr = yStride
+        nc = nRows
+        rStart := nRows - 1
+        writeOrientedBW = func () {
+            for i := uint(0);i < dLen; i++ {
+                writeBW( rStart - (i % nRows), i / nRows )
+            }
+        }
+    } else if o.Row0 == Right && o.Col0 == Bottom {
+        nr = yStride
+        nc = nRows
+        rStart := nRows - 1
+        cStart := yStride - 1
+        writeOrientedBW = func () {
+            for i := uint(0);i < dLen; i++ {
+                writeBW( rStart - i % nRows, cStart - (i / nRows) )
+            }
+        }
+    } else if o.Row0 == Bottom && o.Col0 == Left {
+        nr = nRows
+        nc = yStride
+        rStart := nRows - 1
+        writeOrientedBW = func () {
+            for i := uint(0);i < dLen; i++ {
+                writeBW( rStart - (i / yStride), i % yStride )
+            }
+        }
+    } else if o.Row0 == Bottom && o.Col0 == Right {
+        nr = nRows
+        nc = yStride
+        rStart := nRows - 1
+        cStart := yStride - 1
+        writeOrientedBW = func () {
+            for i := uint(0);i < dLen; i++ {
+                writeBW( rStart - (i / yStride), cStart - (i % yStride) )
+            }
+        }
+    } else if o.Row0 == Left && o.Col0 == Top {
+        nr = yStride
+        nc = nRows
+        writeOrientedBW = func() {
+            for i := uint(0); i < dLen; i++ {
+                writeBW( i % nRows, i / nRows )
+            }
+        }
+    } else if o.Row0 == Left && o.Col0 == Bottom {      // rotation -90
+        nr = yStride
+        nc = nRows
+        cStart := yStride - 1
+        writeOrientedBW = func() {
+            for i := uint(0); i < dLen; i++ {
+                writeBW( i % nRows, cStart - (i / nRows) )
+            }
+        }
+    }
+
+    writeOrientedBW( )
     n, err = cbw.result()
     err = bw.Flush()
     return
@@ -882,76 +964,50 @@ func (jpg *Desc) writeYCbCr( f *os.File, samples [](*[]uint8), sComps []scanComp
     // by C{b/r}s = Cb[((*rC{b/r}VSF)/yVSF)*CbStride + (c*C{b/r}HSF)/yHSF])
     // Depending on actual orientation (Row0 and Col0) the source row r and col
     // c are calculated from the destination index i
+
+    writeRGB := func( r, c uint ) {
+        ys  := float32((*Y)[r*yStride+c])
+        Cbs := float32((*Cb)[((r*CbVSF)/yVSF)*CbStride + (c*CbHSF)/yHSF])
+        Crs := float32((*Cr)[((r*CrVSF)/yVSF)*CrStride + (c*CrHSF)/yHSF])
+
+        rs := int( 0.5 + ys + 1.402*(Crs-128.0) )
+        if rs < 0 { rs = 0 } else if rs > 255 { rs = 255 }
+        gs := int( 0.5 + ys - 0.34414*(Cbs-128.0) - 0.71414*(Crs-128.0) )
+        if gs < 0 { gs = 0 } else if gs > 255 { gs = 255 }
+        bs := int( 0.5 + ys + 1.772*(Cbs-128.0) )
+        if bs < 0 { bs = 0 } else if bs > 255 { bs = 255 }
+
+        cbw.Write( []byte{ byte(rs), byte(gs), byte(bs) } )
+    }
+
+    var writeOrientedRGB func()
     dLen  := uint(len(*Y))
     nRows := dLen / yStride
-    var writeRGB func()
 
     if o == nil || (o.Row0 == Top && o.Col0 == Left ) { // default orientation
         nr = nRows
         nc = yStride
-        writeRGB = func() {
+        writeOrientedRGB = func() {
             for i := uint(0); i < dLen; i++ {
-                r := i / yStride
-                c := i % yStride
-
-                ys  := float32((*Y)[r*yStride+c])
-                Cbs := float32((*Cb)[((r*CbVSF)/yVSF)*CbStride + (c*CbHSF)/yHSF])
-                Crs := float32((*Cr)[((r*CrVSF)/yVSF)*CrStride + (c*CrHSF)/yHSF])
-
-                rs := int( 0.5 + ys + 1.402*(Crs-128.0) )
-                if rs < 0 { rs = 0 } else if rs > 255 { rs = 255 }
-                gs := int( 0.5 + ys - 0.34414*(Cbs-128.0) - 0.71414*(Crs-128.0) )
-                if gs < 0 { gs = 0 } else if gs > 255 { gs = 255 }
-                bs := int( 0.5 + ys + 1.772*(Cbs-128.0) )
-                if bs < 0 { bs = 0 } else if bs > 255 { bs = 255 }
-
-                cbw.Write( []byte{ byte(rs), byte(gs), byte(bs) } )
+                writeRGB( i / yStride, i % yStride )
             }
         }
     } else if o.Row0 == Top && o.Col0 == Right {
         nr = nRows
         nc = yStride
         cStart := yStride - 1
-        writeRGB = func () {
+        writeOrientedRGB = func () {
             for i := uint(0);i < dLen; i++ {
-                r := i/ yStride
-                c := cStart - (i % yStride)
-
-                ys  := float32((*Y)[r*yStride+c])
-                Cbs := float32((*Cb)[((r*CbVSF)/yVSF)*CbStride + (c*CbHSF)/yHSF])
-                Crs := float32((*Cr)[((r*CrVSF)/yVSF)*CrStride + (c*CrHSF)/yHSF])
-
-                rs := int( 0.5 + ys + 1.402*(Crs-128.0) )
-                if rs < 0 { rs = 0 } else if rs > 255 { rs = 255 }
-                gs := int( 0.5 + ys - 0.34414*(Cbs-128.0) - 0.71414*(Crs-128.0) )
-                if gs < 0 { gs = 0 } else if gs > 255 { gs = 255 }
-                bs := int( 0.5 + ys + 1.772*(Cbs-128.0) )
-                if bs < 0 { bs = 0 } else if bs > 255 { bs = 255 }
-
-                cbw.Write( []byte{ byte(rs), byte(gs), byte(bs) } )
+                writeRGB( i / yStride, cStart - (i % yStride) )
             }
         }
     } else if o.Row0 == Right && o.Col0 == Top {        // rotation +90
         nr = yStride
         nc = nRows
         rStart := nRows - 1
-        writeRGB = func () {
+        writeOrientedRGB = func () {
             for i := uint(0);i < dLen; i++ {
-                r := rStart - (i % nRows)
-                c := i / nRows
-
-                ys  := float32((*Y)[r*yStride+c])
-                Cbs := float32((*Cb)[((r*CbVSF)/yVSF)*CbStride + (c*CbHSF)/yHSF])
-                Crs := float32((*Cr)[((r*CrVSF)/yVSF)*CrStride + (c*CrHSF)/yHSF])
-
-                rs := int( 0.5 + ys + 1.402*(Crs-128.0) )
-                if rs < 0 { rs = 0 } else if rs > 255 { rs = 255 }
-                gs := int( 0.5 + ys - 0.34414*(Cbs-128.0) - 0.71414*(Crs-128.0) )
-                if gs < 0 { gs = 0 } else if gs > 255 { gs = 255 }
-                bs := int( 0.5 + ys + 1.772*(Cbs-128.0) )
-                if bs < 0 { bs = 0 } else if bs > 255 { bs = 255 }
-
-                cbw.Write( []byte{ byte(rs), byte(gs), byte(bs) } )
+                writeRGB( rStart - (i % nRows), i / nRows )
             }
         }
     } else if o.Row0 == Right && o.Col0 == Bottom {
@@ -959,46 +1015,18 @@ func (jpg *Desc) writeYCbCr( f *os.File, samples [](*[]uint8), sComps []scanComp
         nc = nRows
         rStart := nRows - 1
         cStart := yStride - 1
-        writeRGB = func () {
+        writeOrientedRGB = func () {
             for i := uint(0);i < dLen; i++ {
-                r := rStart - i % nRows
-                c := cStart - (i / nRows)
-
-                ys  := float32((*Y)[r*yStride+c])
-                Cbs := float32((*Cb)[((r*CbVSF)/yVSF)*CbStride + (c*CbHSF)/yHSF])
-                Crs := float32((*Cr)[((r*CrVSF)/yVSF)*CrStride + (c*CrHSF)/yHSF])
-
-                rs := int( 0.5 + ys + 1.402*(Crs-128.0) )
-                if rs < 0 { rs = 0 } else if rs > 255 { rs = 255 }
-                gs := int( 0.5 + ys - 0.34414*(Cbs-128.0) - 0.71414*(Crs-128.0) )
-                if gs < 0 { gs = 0 } else if gs > 255 { gs = 255 }
-                bs := int( 0.5 + ys + 1.772*(Cbs-128.0) )
-                if bs < 0 { bs = 0 } else if bs > 255 { bs = 255 }
-
-                cbw.Write( []byte{ byte(rs), byte(gs), byte(bs) } )
+                writeRGB( rStart - i % nRows, cStart - (i / nRows) )
             }
         }
     } else if o.Row0 == Bottom && o.Col0 == Left {
         nr = nRows
         nc = yStride
         rStart := nRows - 1
-        writeRGB = func () {
+        writeOrientedRGB = func () {
             for i := uint(0);i < dLen; i++ {
-                r := rStart - (i / yStride)
-                c := i % yStride
-
-                ys  := float32((*Y)[r*yStride+c])
-                Cbs := float32((*Cb)[((r*CbVSF)/yVSF)*CbStride + (c*CbHSF)/yHSF])
-                Crs := float32((*Cr)[((r*CrVSF)/yVSF)*CrStride + (c*CrHSF)/yHSF])
-
-                rs := int( 0.5 + ys + 1.402*(Crs-128.0) )
-                if rs < 0 { rs = 0 } else if rs > 255 { rs = 255 }
-                gs := int( 0.5 + ys - 0.34414*(Cbs-128.0) - 0.71414*(Crs-128.0) )
-                if gs < 0 { gs = 0 } else if gs > 255 { gs = 255 }
-                bs := int( 0.5 + ys + 1.772*(Cbs-128.0) )
-                if bs < 0 { bs = 0 } else if bs > 255 { bs = 255 }
-
-                cbw.Write( []byte{ byte(rs), byte(gs), byte(bs) } )
+                writeRGB( rStart - (i / yStride), i % yStride )
             }
         }
     } else if o.Row0 == Bottom && o.Col0 == Right {
@@ -1006,92 +1034,52 @@ func (jpg *Desc) writeYCbCr( f *os.File, samples [](*[]uint8), sComps []scanComp
         nc = yStride
         rStart := nRows - 1
         cStart := yStride - 1
-        writeRGB = func () {
+        writeOrientedRGB = func () {
             for i := uint(0);i < dLen; i++ {
-                r := rStart - (i / yStride)
-                c := cStart - (i % yStride)
-
-                ys  := float32((*Y)[r*yStride+c])
-                Cbs := float32((*Cb)[((r*CbVSF)/yVSF)*CbStride + (c*CbHSF)/yHSF])
-                Crs := float32((*Cr)[((r*CrVSF)/yVSF)*CrStride + (c*CrHSF)/yHSF])
-
-                rs := int( 0.5 + ys + 1.402*(Crs-128.0) )
-                if rs < 0 { rs = 0 } else if rs > 255 { rs = 255 }
-                gs := int( 0.5 + ys - 0.34414*(Cbs-128.0) - 0.71414*(Crs-128.0) )
-                if gs < 0 { gs = 0 } else if gs > 255 { gs = 255 }
-                bs := int( 0.5 + ys + 1.772*(Cbs-128.0) )
-                if bs < 0 { bs = 0 } else if bs > 255 { bs = 255 }
-
-                cbw.Write( []byte{ byte(rs), byte(gs), byte(bs) } )
+                writeRGB( rStart - (i / yStride), cStart - (i % yStride) )
             }
         }
     } else if o.Row0 == Left && o.Col0 == Top {
         nr = yStride
         nc = nRows
-        writeRGB = func() {
+        writeOrientedRGB = func() {
             for i := uint(0); i < dLen; i++ {
-                r := i % nRows
-                c := i / nRows
-
-                ys  := float32((*Y)[r*yStride+c])
-                Cbs := float32((*Cb)[((r*CbVSF)/yVSF)*CbStride + (c*CbHSF)/yHSF])
-                Crs := float32((*Cr)[((r*CrVSF)/yVSF)*CrStride + (c*CrHSF)/yHSF])
-
-                rs := int( 0.5 + ys + 1.402*(Crs-128.0) )
-                if rs < 0 { rs = 0 } else if rs > 255 { rs = 255 }
-                gs := int( 0.5 + ys - 0.34414*(Cbs-128.0) - 0.71414*(Crs-128.0) )
-                if gs < 0 { gs = 0 } else if gs > 255 { gs = 255 }
-                bs := int( 0.5 + ys + 1.772*(Cbs-128.0) )
-                if bs < 0 { bs = 0 } else if bs > 255 { bs = 255 }
-
-                cbw.Write( []byte{ byte(rs), byte(gs), byte(bs) } )
+                writeRGB( i % nRows, i / nRows )
             }
         }
     } else if o.Row0 == Left && o.Col0 == Bottom {      // rotation -90
         nr = yStride
         nc = nRows
         cStart := yStride - 1
-        writeRGB = func() {
+        writeOrientedRGB = func() {
             for i := uint(0); i < dLen; i++ {
-                r := i % nRows
-                c := cStart - (i / nRows)
-
-                ys  := float32((*Y)[r*yStride+c])
-                Cbs := float32((*Cb)[((r*CbVSF)/yVSF)*CbStride + (c*CbHSF)/yHSF])
-                Crs := float32((*Cr)[((r*CrVSF)/yVSF)*CrStride + (c*CrHSF)/yHSF])
-
-                rs := int( 0.5 + ys + 1.402*(Crs-128.0) )
-                if rs < 0 { rs = 0 } else if rs > 255 { rs = 255 }
-                gs := int( 0.5 + ys - 0.34414*(Cbs-128.0) - 0.71414*(Crs-128.0) )
-                if gs < 0 { gs = 0 } else if gs > 255 { gs = 255 }
-                bs := int( 0.5 + ys + 1.772*(Cbs-128.0) )
-                if bs < 0 { bs = 0 } else if bs > 255 { bs = 255 }
-
-                cbw.Write( []byte{ byte(rs), byte(gs), byte(bs) } )
+                writeRGB( i % nRows, cStart - (i / nRows) )
             }
         }
     }
-    writeRGB()
+//    start := time.Now()
+    writeOrientedRGB()
+//    stop := time.Now()
+//    fmt.Printf( "writeYCbCr: elapsed time %d\n", stop.Sub(start) )
     n, err = cbw.result()
     err = bw.Flush()
     return
 }
 
 
-func (jpg *Desc) SavePackedRGBPicture( path string,
-                                       ort *Orientation ) ( nCols, nRows uint,
-                                                            n int, err error) {
-//    return 0, fmt.Errorf("SavePackedRGBPicture: Unsupported\n")
+func (jpg *Desc) SaveRawPicture( path string, bw bool,
+                                 ort *Orientation ) ( nCols, nRows uint,
+                                                      n int, err error) {
     if ! jpg.IsComplete() || len(jpg.frames) == 0 {
-        return 0, 0, 0, fmt.Errorf( "SavePackedRGBPicture: no frame to save\n" )
+        return 0, 0, 0, fmt.Errorf( "SaveRawPicture: no frame to save\n" )
     }
     if len(jpg.frames) > 1 {
-        return 0, 0, 0, fmt.Errorf( "SavePackedRGBPicture: multiple framre are not supported\n" )
+        return 0, 0, 0, fmt.Errorf( "SaveRawPicture: multiple framre are not supported\n" )
     }
     frm := jpg.frames[0]
     sc := frm.scans[0]
     if sc.mcuD == nil || len(sc.mcuD.sComps) == 0 {
-        return 0, 0, 0, fmt.Errorf( "SavePackedRGBPicture: no scan available for picture\n" )
+        return 0, 0, 0, fmt.Errorf( "SaveRawPicture: no scan available for picture\n" )
     }
 
     cmps := sc.mcuD.sComps
@@ -1100,7 +1088,7 @@ func (jpg *Desc) SavePackedRGBPicture( path string,
     case 8:
         samples = make8BitComponentArrays( cmps )
     default:
-        return 0, 0, 0, fmt.Errorf( "SavePackedRGBPicture: extended precision is not supported\n" )
+        return 0, 0, 0, fmt.Errorf( "SaveRawPicture: extended precision is not supported\n" )
     }
     var f *os.File
     f, err = os.OpenFile( path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, os.ModePerm)
@@ -1109,10 +1097,15 @@ func (jpg *Desc) SavePackedRGBPicture( path string,
     }
     defer func ( ) { if e := f.Close(); err == nil { err = e } }()
     switch len( cmps ) {
+    case 3:
+        if ! bw {
+            nCols, nRows, n, err = jpg.writeYCbCr( f, samples, cmps, ort )
+            break
+        }
+        fallthrough
     case 1: nCols, nRows, n, err = jpg.writeBW( f, samples, cmps, ort )
-    case 3: nCols, nRows, n, err = jpg.writeYCbCr( f, samples, cmps, ort )
     default:
-        err = fmt.Errorf("SavePackedRGBPicture: not YCbCr or Gray scale picture\n")
+        err = fmt.Errorf("SaveRawPicture: not YCbCr or Gray scale picture\n")
     }
     return
 }

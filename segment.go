@@ -543,11 +543,6 @@ func (jpg *Desc) processScan( marker, sLen uint ) error {
                 fmt.Printf( "  WARNING: invalid RST sequence (%d, expected %d)\n",
                             RST, (lastRST + 1) % 8 )
             }
-//            if jpg.Fix {
-//                RST = (lastRST + 1) % 8
-//                jpg.data[nIx+1] = byte(0xd0 + RST)
-//                fmt.Printf( "  FIXING: setting RST sequence: %d\n", RST )
-//            }
         }
         lastRSTIndex = nIx
         lastRST = RST
