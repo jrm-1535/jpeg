@@ -7,3 +7,8 @@ found in the input file. It checks the validity of those tables and scans and
 allow fixing some common small errors (incorrect number of lines, duplicate or
 useless markers). It is mostly useful to understand what might be wrong with a
 jpeg file.
+
+I can also generate a raw RGB or greyscale picture after decoding.
+
+Baseline sequential, extended sequential and progressive are supported only
+in huffman mode. No arithmetic coding and no hierarchical modes yet.

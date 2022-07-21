@@ -524,7 +524,7 @@ var rlCodes = [][]int16{
       2040,  2041,  2042,  2043,  2044,  2045,  2046,  2047 },
   }
 
-func printDataUnit( dU *[64]int ) {
+func printDataUnit( dU *dataUnit ) {
     for r := 0; r < 8; r++ {
         if r == 0 {
             fmt.Printf( "Data Unit:" )
@@ -538,91 +538,89 @@ func printDataUnit( dU *[64]int ) {
     fmt.Printf( "\n" )
 }
 
-func (jpg *Desc) getBits( startByte, val uint, startBit, nBits uint8 ) string {
+func (jpg *Desc) getBitString( startByte uint, startBit uint8, nBits uint ) string {
+//fmt.Printf("startByte %#x startBit=%d nBits=%d\n", startByte, startBit, nBits)
 
-//    fmt.Printf("startByte %#x val %#x startBit=%d nBits=%d\n",
-//                startByte, val, startBit, nBits)
-    if startBit >= 8 { panic("startBit >= 8") }
+    if startBit >= 8 {
+        fmt.Printf("getBitString: startBit %d\n", startBit)
+        panic("startBit >= 8")
+    }
 
-    var buf bytes.Buffer
-    if nBits == 0 {
-        fmt.Fprintf( &buf, "offset=%#x [%#02x    .--------]",
-                    startByte, jpg.data[startByte])
-    } else {
 //offset=0x269 [0xf5       00111---] Huffman: size 7 (0-runlength 0)
 //offset=0x26a [0xf512     -----101 0001----] DC: decoded=81 cumulative=81
-        fmt.Fprintf( &buf, "offset=%#x [%#02x",
-                    startByte, jpg.data[startByte])
-
-        xBytes :=  (startBit + nBits-1) / 8
-        for i:= uint8(1); i <= xBytes; i++ {
-            fmt.Fprintf( &buf, "%02x", jpg.data[startByte+uint(i)])
-        }
-        for i:= xBytes; i < 2; i++ {
-        	buf.Write([]byte("  "))
-        }
-	    buf.Write([]byte("."))
-        nBytes := xBytes + 1
-
-        //e.g. -----101 0001----
-        var i uint8
-        for ; i < startBit; i++ {
-            buf.Write([]byte("-"))
-        }
-
-        if val > 0xffff { panic("val > 0xffff") }
-
-        s := int(startBit)  // might become negative during following operations
-        n := int(nBits)
-
-        if s + n <= 8 {
-            fmt.Fprintf( &buf, "%0*b", n, val )
-        } else {
-            fmt.Fprintf( &buf, "%0*b", 8 - s, val >> uint(s + n - 8) )
-            buf.Write([]byte(" "))
-            s -= 8
-            if s + n > 8 { // at most 7 + 16
-                //fmt.Printf( "reminings bits=%d\n", s + n
-                v := val >> uint(s + n - 8)
-                fmt.Fprintf( &buf, "%0*b", 8, v & 0xff )
-                buf.Write([]byte(" "))
-                s -= 8
-            }
-            //fmt.Printf( "reminings bits=%d\n", s + n
-            val &= ((1 << uint(s + n)) -1)
-            fmt.Fprintf( &buf, "%0*b", s + n, val )
-        }
-        i += nBits
-        //fmt.Printf( "nBytes=%d\n", nBytes )
-        //    fmt.Fprintf( &buf, "%0*b", nBits, val )
-
-        for ; i < nBytes * 8; i++ {
-            if i % 8 == 0   {
-                buf.Write([]byte(" "))
-            }
-            buf.Write([]byte("-"))
-        }
-        buf.Write([]byte("]"))
+    var buf bytes.Buffer
+    var v = jpg.data[startByte]
+    inBit := uint(startBit)
+    outBit := uint(startBit) + nBits
+    //e.g. -----101 0001----
+    beyond := ((outBit + 7) >> 3)  << 3
+    if beyond == 0 {
+        beyond = 8
     }
+
+    fmt.Fprintf( &buf, "offset=%#x [%#02x", startByte, v)
+    xBytes :=  (beyond / 8) - 1
+/*
+if xBytes > 4 {
+    fmt.Printf("outBit %d, xBytes %d, startBit %d, nBits %d\n", outBit, xBytes, startBit, nBits )
+    panic("xBytes")
+}
+*/
+    for i:= uint(1); i <= xBytes; i++ {
+        fmt.Fprintf( &buf, "%02x", jpg.data[startByte+uint(i)])
+    }
+
+    for i:= xBytes; i < 2; i++ {
+        buf.Write([]byte("  "))
+    }
+    buf.Write([]byte("="))
+
+// MCU=2 comp=0 du=0,2 coef=6 offset=0x44d8 [0xe78b  =------11100.....] Huffman: size 0 (0-runlength 1)
+
+    for i := uint(0); i < beyond; {
+
+        if  i < inBit || i >= outBit {
+            if i < inBit {
+                buf.Write([]byte("-"))
+            } else {
+                buf.Write([]byte("."))
+            }
+            v <<= 1
+        } else {
+            var b uint8
+            if v & 0x80 == 0x80 {
+                b = '1'
+            } else {
+                b = '0'
+            }
+            v <<= 1
+            buf.WriteByte(b)
+        }
+        i++
+        if i % 8 == 0 {
+            if i != beyond {
+                buf.Write([]byte(" "))
+            }
+            startByte++
+            startBit = 0
+            v = jpg.data[startByte]
+        }
+    }
+    buf.Write([]byte("]"))
     return buf.String()
 }
 
-// must be called at the end of each scan with currentScan available
-func (jpg *Desc) dequantize( sc *scan ) error {
+// must be called after all scans have been processed for a single frame
+func (jpg *Desc) dequantize( f *frame ) error {
 
-    for _, cmp := range sc.mcuD.sComps {
+    for _, cmp := range f.components {          // for each component in frame
 
-        if cmp.quId > 3 { return fmt.Errorf("dequantize: table out of range\n") }
-        qz := jpg.qdefs[cmp.quId]
-        if qz.size != uint(cmp.quSz) {
-            return fmt.Errorf(
-                "dequantize: sample size (%d) does not match matrix (%d)\n",
-                cmp.quSz, qz.size )
-        }
+        if cmp.QS > 3 { return fmt.Errorf("dequantize: table out of range\n") }
+        qz := jpg.qdefs[cmp.QS]
 
-        for _, duRow := range cmp.iDCTdata {    // one DU row
-            for k := 0; k < len(duRow); k++ {   // one data unit
-                du := &duRow[k]                 // pointer (will be modified)
+        for _, duRow := range cmp.iDCTdata {    // for each DU row
+            for k := 0; k < len(duRow); k++ {   // for each data unit
+                du := &duRow[k]                 // pointer to du (du is updated)
                 var uZZdu dataUnit              // temporary storage
                 i := 0
                 for r := 0; r < 8; r ++ {       // dequantize DCT coefficients
@@ -857,20 +855,34 @@ func inverseDCT8( du *dataUnit, start []uint8, stride uint ) {
 }
 */
 
-func (jpg *Desc) processECS( nMCUs uint ) (uint, error) {
+// called for sequential DCT scans or initial progressive scan for DC only
+// coefficient (scan.startSS == 0, scan.endSS == 0 and scan.sABPh == 0).
+// In the latter case, the point transform (<< scan.sABPl) is applied before
+// storing the DC coefficient. Since sABPl is 0 for sequential DCT scans, this
+// has no effect on sequential scans.
+func (jpg *Desc) processSequentialEcs( nMCUs uint, scan *scan ) (uint, error) {
 
-    scan := jpg.getCurrentScan()
-    if scan == nil { panic("Internal error (no scan for ECS)\n") }
-
+    if ( scan.startSS != 0 || scan.sABPh != 0 ) {
+        panic( "processSequentialEcs called for wrong scan" )
+    }
+    fmt.Printf( "Entering processSequentialEcs Approximation bits h=%d l=%d spectral selection start=%d end=%d\n",
+                scan.sABPh, scan.sABPl, scan.startSS, scan.endSS )
     /*  after each RST, reset previousDC, dUAnchor, dUCol, dURow & count
         for each scan component (Y[,Cb,Cr]) */
-    for i := len(scan.mcuD.sComps)-1; i >= 0; i-- {
-        scan.mcuD.sComps[i].previousDC = 0
-        scan.mcuD.sComps[i].dUAnchor = 0  // RST could happen in the middle
-        scan.mcuD.sComps[i].dUCol = 0     
-        scan.mcuD.sComps[i].dURow = 0
-        scan.mcuD.sComps[i].count = 0
+    for i := len(scan.sComps)-1; i >= 0; i-- {
+fmt.Printf("  sComp %d: HSF=%d, nUnitsRow=%d\n", i, scan.sComps[i].HSF, scan.sComps[i].nUnitsRow)
+        scan.sComps[i].previousDC = 0   // restart DC delta
+        scan.sComps[i].dUCol = 0
+        scan.sComps[i].dURow = 0
+        scan.sComps[i].dUAnchor = (nMCUs * uint(scan.sComps[i].HSF)) %
+                                            scan.sComps[i].nUnitsRow
+        scan.sComps[i].nRows = (nMCUs * uint(scan.sComps[i].HSF)) /
+                                            scan.sComps[i].nUnitsRow
+//fmt.Printf("processSequentialEcs: comp index %d, rows=%d dUAnchor=%d\n",
+//            i, scan.sComps[i].nRows, scan.sComps[i].dUAnchor)
+        scan.sComps[i].count = 0       // always start at DC
     }
+
 /*
     Each scan component (sComp) gives the number of dataUnits that the
     component can use (hSF *vSF). This is a small rectangular area whose
@@ -883,13 +895,13 @@ func (jpg *Desc) processECS( nMCUs uint ) (uint, error) {
     dUcol are reset to 0 for the next area, and sCompIndex is incremented
     modulo the number of components (len(mcusDsc.sComps)).
 
-    Once UnitAnchor is found above nUnitsRow, the whole dUnits array is copied
-    to the component DCT area for further processing, unitAnchor is reset to 0
-    and the same dUnits array is reused for the next slice of data units
 */
-    sCompIndex := 0                     // first component in MCU (Y)
-    sComp := &scan.mcuD.sComps[0]       // first component definition
-    dUnit := &sComp.dUnits[0]           // first data unit in component
+    sCompIndex := 0                     // first component in MCU
+    sComp := &scan.sComps[0]            // first component definition
+
+    // restart where we stopped
+    dUnit := &((*sComp.iDCTdata)[sComp.nRows][sComp.dUAnchor])
+//    dUnit := &((*sComp.cData)[0][0])    // first data unit in component
 
 /*
     Within a data unit, the first sample is always DC and the 63 following
@@ -909,20 +921,15 @@ func (jpg *Desc) processECS( nMCUs uint ) (uint, error) {
     - ZRL = 0xf0, indicates a series of 16 zero samples. ZRL applies only to AC
       samples.
 
-    In case of progressive scans, 13 additional special values are defined.
-    They all apply only to AC samples:
-    - EOBn, followed by n bit => EOB + (2^n) following data units of AC samples
+    Note that in case of progressive scans, 13 additional special values are
+    defined. They all apply only to AC samples (not relevant here):
+    - EOBn followed by n bits => EOB + (2^n) following data units of AC samples
                                  are zero (DC samples are in 1 separate scan)
     Where EOBn is [0x10..0xe0]
 */
     huffman := true                     // always start with huffman code
     var curHcnode *hcnode
-    if scan.startSS == 0 {              // spectral selection starts with DC
-        curHcnode = sComp.hDC           // start with encoded DC
-    } else {
-        curHcnode = sComp.hAC           // start with encoded AC
-    }
-
+    curHcnode = sComp.hDC               // always start with encoded DC
     var curByte, nBits uint8            // hold current encoded bits
     var runLen, size uint8              // current decoded runlength & size
     var codeBit uint8                   // n bits in current code
@@ -939,6 +946,8 @@ func (jpg *Desc) processECS( nMCUs uint ) (uint, error) {
     var startByte = i                   // offset of the first byte contributing to code
     var startBit uint8                  // bit offset into startByte
 
+    var padding = false                 // indicates stuffing at end of ECS
+
 encodedLoop:
     for ; i < tLen-1; i ++ {            // byte loop
         curByte = jpg.data[i]           // load next byte
@@ -949,34 +958,38 @@ encodedLoop:
             if i >= tLen-1 || jpg.data[i] != 0x00 {
                 i--     // backup for next marker and stop
                 if jpg.Mcu && jpg.Begin <= nMCUs && jpg.End >= nMCUs {
-                    fmt.Printf( "MCU=%d comp=%d du=%d,%d offset=%#x [%#02x] " +
+                    fmt.Printf( "MCU=%d comp=%d du=%d,%d coef=%d offset=%#x [%#02x] " +
                                 "End of scan segment (found marker or RST)\n",
-                                nMCUs, sCompIndex, sComp.dURow, sComp.dUCol, i, curByte )
+                                nMCUs, sCompIndex, sComp.dURow, sComp.dUCol,
+                                sComp.count, i, curByte )
                 }
 
                 warning := false
-                for k := len(scan.mcuD.sComps)-1; k >= 0; k-- {
-                    if scan.mcuD.sComps[k].dUAnchor != 0 ||
-                       scan.mcuD.sComps[k].dURow != 0 ||
-                       scan.mcuD.sComps[k].dUCol != 0 ||
-                       scan.mcuD.sComps[k].count != 0 {
+                for k := len(scan.sComps)-1; k >= 0; k-- {
+                    if scan.sComps[k].dUAnchor != 0 ||
+                       scan.sComps[k].dURow != 0 ||
+                       scan.sComps[k].dUCol != 0 ||
+                       scan.sComps[k].count != 0 {
                         warning = true
                         fmt.Printf( "Warning: incomplete component %d (%d rows):"+
                                     " anchor %d (max %d) row %d col %d count %d\n",
-                                k, scan.mcuD.sComps[k].nRows,
-                                scan.mcuD.sComps[k].dUAnchor,
-                                scan.mcuD.sComps[k].nUnitsRow,
-                                scan.mcuD.sComps[k].dURow,
-                                scan.mcuD.sComps[k].dUCol,
-                                scan.mcuD.sComps[k].count )
+                                k, scan.sComps[k].nRows,
+                                scan.sComps[k].dUAnchor,
+                                scan.sComps[k].nUnitsRow,
+                                scan.sComps[k].dURow,
+                                scan.sComps[k].dUCol,
+                                scan.sComps[k].count )
                     }
                 }
                 if warning {
-                    fmt.Printf( "MCU=%d comp=%d du=%d,%d offset=%#x [%#02x] " +
+                    fmt.Printf( "MCU=%d comp=%d du=%d,%d coef=%d offset=%#x [%#02x] " +
                                 "Unexpected end of scan segment\n",
-                                nMCUs, sCompIndex, sComp.dURow, sComp.dUCol, i, curByte )
+                                nMCUs, sCompIndex, sComp.dURow, sComp.dUCol,
+                                sComp.count, i, curByte )
                 }
                 break                   // return condition
+            } else if padding {
+                panic( "Padding not at the end of entropy coded segment\n" )
             }
         }
         for {                           // curbyte bit loop
@@ -985,8 +998,24 @@ encodedLoop:
                     if nBits == 0 { continue encodedLoop } // need more bits
                         
                     if (curByte & 0x80) == 0x80 {
-                        if curHcnode.left == nil { panic("Invalid code/huffman tree (left)\n") }
                         curHcnode = curHcnode.left
+                        if curHcnode == nil {
+                            padding = true;     // maybe byte stuffing at the end
+                            fmt.Printf("possible padding curByte=0x%02x nBits=%d\n", curByte, nBits );
+                            for {
+                                nBits --
+                                if nBits == 0 {
+                                    if 0 == jpg.data[i] {
+                                        i++;    // unlikely 0xff00 before marker (skip)
+                                    }
+                                    continue encodedLoop    // end of ECS
+                                }
+                                curByte <<= 1
+                                if (curByte & 0x80) != 0x80 {
+                                    panic("Invalid code/huffman tree (left)\n")
+                                }
+                            }
+                        }
                         huffval <<= 1
                         huffval ++
                     } else {
@@ -994,7 +1023,6 @@ encodedLoop:
                         curHcnode = curHcnode.right
                         huffval <<= 1
                     }
-
                     curByte <<= 1
                     nBits --
                     huffbits ++
@@ -1004,18 +1032,14 @@ encodedLoop:
                         runLen = runSize >> 4      // runlength, remaining 4
                         size = runSize & 0x0f      // are size in all cases
                         if jpg.Mcu && jpg.Begin <= nMCUs && jpg.End >= nMCUs {
-                            fmt.Printf( "MCU=%d comp=%d du=%d,%d %s Huffman: " +
+                            fmt.Printf( "MCU=%d comp=%d du=%d,%d coef=%d %s Huffman: " +
                                         "size %d (0-runlength %d)\n",
-                                        nMCUs, sCompIndex, sComp.dURow, sComp.dUCol,
-                                        jpg.getBits( startByte, uint(huffval),
-                                        startBit, huffbits ), size, runLen )
+                                        nMCUs, sCompIndex, sComp.dURow, sComp.dUCol, sComp.count,
+                                        jpg.getBitString( startByte,startBit, uint(huffbits) ),
+                                        size, runLen )
                         }
-                        startBit += huffbits
-                        huffval = 0
-                        huffbits = 0
-                        huffman = false // next <size> bits are code
-                        codeBit = 0     // 0 bit of following code is extracted
-                        code = 0
+                        huffval, huffbits, huffman = 0, 0, false
+                        codeBit, code = 0, 0
                         break           // end huffman bit loop
                     }
                 }
@@ -1023,7 +1047,7 @@ encodedLoop:
                 if ( sComp.count == 0 ) {   // first code is for DC
                     if size > 11 {      // code bits to extract from curByte
                         return nMCUs, fmt.Errorf(
-                            "processECS: DC coef size (%d) > 11 bits\n", size)
+                            "processSequentialEcs: DC coef size (%d) > 11 bits\n", size)
                     }
 
                     for ; codeBit < size; codeBit++ {   // extract code bits
@@ -1043,54 +1067,60 @@ encodedLoop:
 
                     if jpg.Mcu && jpg.Begin <= nMCUs && jpg.End >= nMCUs {
                         fmt.Printf(
-                    "MCU=%d comp=%d du=%d,%d %s DC: decoded=%d cumulative=%d\n",
+                    "MCU=%d comp=%d du=%d,%d coef=0 %s DC: decoded=%d cumulative=%d\n",
                     nMCUs, sCompIndex, sComp.dURow, sComp.dUCol,
-                    jpg.getBits( startByte, code, startBit, size ),
+                    jpg.getBitString( startByte, startBit, uint(size) ),
                     decodedDC, sComp.previousDC )
 //  fmt.Printf( "[MCU=%d offset=%#x.%d component=%d] DC: size=0x%x, code=%#b (%#02x), decodedDC=%d cumulative DC=%d\n",
 //              nMCUs, i, 8-nBits, sCompIndex, size, code, code, decodedDC, sComp.previousDC )
                     }
 
-                    (*dUnit)[0] = sComp.previousDC  // store in first data unit slot
+                    // store in first data unit slot after point transform
+                    (*dUnit)[0] = sComp.previousDC << scan.sABPl
+//fmt.Printf("(*dUnit)[0] = %d\n", (*dUnit)[0] );
+//                    huffman = true
+                    // in sequential DCT scans, scan.endSS is always 63, but in
+                    // case of initial progressive scan for DC only coefficient,
+                    // scan.endSS is always 0 (no following AC coefficients).
+                    if scan.endSS == 0 {        // done with this data unit
+                        sComp.count = 64        // will be reset for next one
+                    } else {
+                        sComp.count = 1         // 1 sample (DC) processed
+//                        curHcnode = sComp.hAC   // ready for following AC coefs
+                    }
 
-                    startBit += size
-                    sComp.count = 1         // 1 sample (DC) processed
-                    curHcnode = sComp.hAC   // ready for following AC symbols
-                    huffman = true
-
-                }  else {                   // AC values
+                } else {                   // AC values
                     if runLen == 0 && size == 0 { // EOB => following AC coefs are 0
+                        //fmt.Printf( "AC, EOB, next data Unit DC\n" );
                         if jpg.Mcu && jpg.Begin <= nMCUs && jpg.End >= nMCUs {
                             fmt.Printf(
-                            "MCU=%d comp=%d du=%d,%d %s AC: EOB for this data unit\n",
-                            nMCUs, sCompIndex, sComp.dURow, sComp.dUCol,
-                            jpg.getBits( startByte, code, startBit, size ) )
+                            "MCU=%d comp=%d du=%d,%d coef=%d %s AC: EOB for this data unit\n",
+                            nMCUs, sCompIndex, sComp.dURow, sComp.dUCol, sComp.count,
+                            jpg.getBitString( startByte, startBit, uint(size) ) )
                         }
-                        for n:= sComp.count; n < 64; n++ {  // in zigzag order
-                            (*dUnit)[n]  = 0
-                        }
+                        // just skip (not modified in any way)
                         sComp.count = 64     // ready for next data unit
 
                     } else if runLen == 15 && size == 0 {   // ZRL => 16 0s
+                        //fmt.Printf( "AC, ZRL (16 Zeros) end @ count %d\n",
+                        //            sComp.count + 16 )
                         if jpg.Mcu && jpg.Begin <= nMCUs && jpg.End >= nMCUs {
                             fmt.Printf(
-                            "MCU=%d comp=%d du=%d,%d %s AC: ZRL => 16 bytes = 0\n",
-                            nMCUs, sCompIndex, sComp.dURow, sComp.dUCol,
-                            jpg.getBits( startByte, code, startBit, size ) )
+                            "MCU=%d comp=%d du=%d,%d  coef=%d %s AC: ZRL => 16 bytes = 0\n",
+                            nMCUs, sCompIndex, sComp.dURow, sComp.dUCol, sComp.count,
+                            jpg.getBitString( startByte, startBit, uint(size) ) )
                         }
                         if sComp.count+16 > 64 {
                             return nMCUs, fmt.Errorf(
-                                  "processECS: ZRL over the end of data uint\n")
+                                  "processSequentialEcs: ZRL over the end of data unit\n")
                         }
-                        for n:= uint8(0); n < 16; n++ {     // in zigzag order
-                            (*dUnit)[sComp.count+n] = 0
-                        }
+                        // just skip (not modified in any way)
                         sComp.count += 16
 
                     } else {                // not a special case, size is not 0
                         if size < 1 || size > 10 {
                             return nMCUs, fmt.Errorf(
-                             "processECS: AC coef size (%d) not in [1-10] bits\n",
+                             "processSequentialEcs: AC coef size (%d) not in [1-10] bits\n",
                               size)
                         }
                         for ; codeBit < size; codeBit++ {
@@ -1106,114 +1136,906 @@ encodedLoop:
                             nBits --
 
                         }
+                        //fmt.Printf("AC, runlength %d size %d, ends @ count %d\n",
+                        //            runLen, size, sComp.count + runLen + 1 )
                         decodedAC := rlCodes[size][code]
 
                         if jpg.Mcu && jpg.Begin <= nMCUs && jpg.End >= nMCUs {
                             fmt.Printf(
-                            "MCU=%d comp=%d du=%d,%d %s AC: runlength %d decoded=%d\n",
-                            nMCUs, sCompIndex, sComp.dURow, sComp.dUCol,
-                            jpg.getBits( startByte, code, startBit, size ),
+                            "MCU=%d comp=%d du=%d,%d coef=%d %s AC: runlength %d decoded=%d\n",
+                            nMCUs, sCompIndex, sComp.dURow, sComp.dUCol, sComp.count,
+                            jpg.getBitString( startByte, startBit, uint(size) ),
                             runLen, decodedAC )
                         }
-                        if sComp.count+runLen > 64 {
+                        if sComp.count+runLen > 63 {    // + 1 byte after runLen 0s
                             return nMCUs, fmt.Errorf(
-                             "processECS: Runlength %d over the end of data uint\n",
+                             "processSequentialEcs: Runlength %d over the end of data uint\n",
                              runLen)
                         }
-                        for n:= uint8(0); n < runLen; n++ { // in zigzag order
-                            (*dUnit)[sComp.count+n] = 0
-                        }
+//                        for n:= uint8(0); n < runLen; n++ { // in zigzag order
+//                            (*dUnit)[sComp.count+n] = 0
+//                        }
+                        // just skip (not modified in any way)
                         sComp.count += runLen
-                        startBit += size
                         // store decoded AC in next slot of current data unit
                         (*dUnit)[sComp.count] = decodedAC
                         sComp.count++
                     }
-                    if sComp.count == 64 {  // end of data unit
-//                        printDataUnit( dUnit )
-                        sComp.dUCol++
-                        if sComp.dUCol >= sComp.hSF {
-                            sComp.dUCol = 0
-                            sComp.dURow++
-                            if sComp.dURow >= sComp.vSF {
-                                sComp.dURow = 0     // end of current component
-                                sComp.dUAnchor += sComp.hSF // ready for next du
-                                sCompIndex++
-                                if sCompIndex >= len(scan.mcuD.sComps) {
-                                    sCompIndex = 0
-                                    nMCUs ++        // new MCU
+                }
+                if sComp.count == 64 {  // end of data unit
+//fmt.Printf( "End of data unit\n" )
+                    if jpg.Control.Du && jpg.Begin <= nMCUs && jpg.End >= nMCUs {
+                        printDataUnit( dUnit )
+                    }
+                    sComp.dUCol++
+                    if sComp.dUCol >= uint(sComp.HSF) {
+                        sComp.dUCol = 0
+                        sComp.dURow++
+                        if sComp.dURow >= uint(sComp.VSF) {
+                            sComp.dURow = 0     // end of current component
+                            sComp.dUAnchor += uint(sComp.HSF) // ready for next du
+                            sCompIndex++
+                            if sCompIndex >= len(scan.sComps) {
+                                sCompIndex = 0
+                                nMCUs ++        // new MCU
+                            }
+                            //fmt.Printf("!!! Switching to component %d\n", sCompIndex)
+                            sComp = &scan.sComps[sCompIndex]
+                            if sComp.dUAnchor == sComp.nUnitsRow { // end of DU row
+                            // TODO: move into separate function?
+                                if jpg.nMcuRST != 0 &&
+                                   nMCUs % jpg.nMcuRST != 0 && jpg.Warn {
+                                    fmt.Printf(
+                                        "Warning: end of slice @MCU %d is "+
+                                        "not synced with RST intervals (%d)\n",
+                                        nMCUs, jpg.nMcuRST )
                                 }
-//                                fmt.Printf("!!! Switching to component %d\n", sCompIndex)
-                                sComp = &scan.mcuD.sComps[sCompIndex]
-                                if sComp.dUAnchor == sComp.nUnitsRow { // end of DU row
-// TODO: move into separate function?
-                                    if jpg.nMcuRST != 0 &&
-                                       nMCUs % jpg.nMcuRST != 0 && jpg.Warn {
-                                        fmt.Printf(
-                                            "Warning: end of slice @MCU %d is "+
-                                            "not synced with RST intervals (%d)\n",
-                                            nMCUs, jpg.nMcuRST )
-                                    }
-                                    for sci := 0; sci < len(scan.mcuD.sComps); sci++ {
-                                        // new row for each component
-                                        sc := &scan.mcuD.sComps[sci]
-                                        for i := uint(0); i < sc.vSF; i ++ {
-                                            sc.iDCTdata = append( sc.iDCTdata, iDCTRow{} )
-                                            dctRow := len(sc.iDCTdata) - 1
-                                            cDUs := make( []dataUnit, sc.nUnitsRow )
-                                            copy( cDUs, sc.dUnits[i*sc.nUnitsRow:
-                                                                  (i+1)*sc.nUnitsRow] )
-                                            sc.iDCTdata[dctRow] = append( sc.iDCTdata[dctRow], cDUs... )
-/*
-                                            for j := uint(0); j < sc.nUnitsRow; j ++ {
-                                                cDU := sc.dUnits[i*sc.nUnitsRow+j]
-                                                sc.iDCTdata[dctRow] = append( sc.iDCTdata[dctRow], cDU )
-                                            }
-*/
-                                            sc.nRows++
-                                        }
-/*
-                                        for i := uint(0); i < sc.vSF; i ++ {
-                                            sc.iDCTdata = append( sc.iDCTdata, iDCTRow{} )
-                                            dctRow := len(sc.iDCTdata) - 1
-                                            sc.iDCTdata[dctRow] = append( sc.iDCTdata[dctRow], sc.dUnits[
-                                               (i*sc.nUnitsRow/sc.vSF) :
-                                               (i*sc.nUnitsRow/sc.vSF)+(sc.nUnitsRow/sc.vSF)]... )
-                                            sc.nRows++
-                                        }
-*/
-                                      sc.dUAnchor = 0
-                                        sc.dURow = 0
-                                        sc.dUCol = 0
-                                        sc.count = 0
-                                    }
+                                for sci := 0; sci < len(scan.sComps); sci++ {
+                                    // new row for each component
+                                    sc := &scan.sComps[sci]
+                                    sc.nRows += uint(sc.VSF)
+                                    sc.dUAnchor = 0
+                                    sc.dURow = 0
+                                    sc.dUCol = 0
+                                    sc.count = 0
                                 }
                             }
                         }
-                        sComp.count = 0
-                        dUnit = &sComp.dUnits[sComp.dUAnchor +
-                                              (sComp.nUnitsRow * sComp.dURow) +
-                                              sComp.dUCol]
-//                        fmt.Printf("Ready for next data unit: component %d anchor %d row %d col %d\n",
-//                                    sCompIndex, sComp.dUAnchor, sComp.dURow, sComp.dUCol)
-                        curHcnode = sComp.hDC   // new data unit starts with DC coefficient
-                    } else {
-                        curHcnode = sComp.hAC   // same data unit, keep working on AC
                     }
-                    huffman = true
-                    //panic ("Debug\n" )
+                    if len(*sComp.iDCTdata) > int(sComp.nRows+sComp.dURow) {
+                        //fmt.Printf("Ready for next data unit: component %d anchor %d row %d col %d\n",
+                        //           sCompIndex, sComp.dUAnchor, sComp.dURow, sComp.dUCol)
+                        dUnit = &((*sComp.iDCTdata)[sComp.nRows+sComp.dURow][sComp.dUAnchor+sComp.dUCol])
+                    } else {
+                        //fmt.Printf( "Reached end of pre-allocated data units\n" )
+                        dUnit = nil     // temporarily: force panic if any data is written afterwards
+                    }
+                    sComp.count = 0
+                    curHcnode = sComp.hDC   // new data unit starts with DC coefficient
+                } else {                    // same data unit, keep working on AC
+                    curHcnode = sComp.hAC   // but need to restart from the Huffman root
                 }
+                huffman = true
             }
-//            fmt.Printf("startBit %d nBits %d\n", startBit, nBits)
-            startBit %= 8
-            if startBit == 0 {
+
+            startBit = 8 - nBits    // remaining in curByte
+            if startBit == 8 {
                 startByte = i+1
+                startBit = 0
             } else {
                 startByte = i
             }
-        }
+//            fmt.Printf("startBit %d nBits %d\n", startBit, nBits)
+        }   // end curbyte bit loop
+    }   // end encodedLoop
+
+    jpg.offset = i  // stopped at 0xFF followed by non-zero byte or at tLen-1
+    return nMCUs, nil
+}
+
+func (jpg *Desc) processRefiningDcEcs( nMCUs uint, scan *scan ) (uint, error) {
+
+    if scan.startSS != 0 || scan.endSS != 0 || scan.sABPh == 0 {
+        panic( "processRefiningDcEcs called for wrong scan" )
     }
 
+    fmt.Printf( "Entering processRefiningDcEcs Approximation bits h=%d l=%d spectral selection start=%d end=%d\n",
+                scan.sABPh, scan.sABPl, scan.startSS, scan.endSS )
+
+    /*  after each RST, reset previousDC, dUAnchor, dUCol, dURow & count
+        for each scan component (Y[,Cb,Cr]) */
+    for i := len(scan.sComps)-1; i >= 0; i-- {
+        //scan.mcuD.sComps[i].previousDC = 0    // unused
+        scan.sComps[i].dUCol = 0
+        scan.sComps[i].dURow = 0
+        scan.sComps[i].dUAnchor = (nMCUs * uint(scan.sComps[i].HSF)) %
+                                    scan.sComps[i].nUnitsRow
+        scan.sComps[i].nRows = (nMCUs * uint(scan.sComps[i].HSF)) /
+                                    scan.sComps[i].nUnitsRow
+//fmt.Printf("processRefiningDcEcs: comp index %d, rows=%d dUAnchor=%d\n",
+//            i, scan.sComps[i].nRows, scan.sComps[i].dUAnchor)
+        scan.sComps[i].count = 0       // only DC coefficient
+    }
+
+    sCompIndex := 0                     // first component in MCU
+    sComp := &scan.sComps[0]            // first component definition
+
+    // restart where we stopped
+    dUnit := &((*sComp.iDCTdata)[sComp.nRows][sComp.dUAnchor])
+    var curByte, nBits uint8            // hold current encoded bits
+
+    // encoded loop 1 byte at a time: start at 1st byte following header or RST
+    tLen := uint(len( jpg.data ))
+    i := jpg.offset
+
+    var padding = false                 // indicates stuffing at end of ECS
+
+encodedLoop:
+    for ; i < tLen-1; i ++ {            // byte loop
+        curByte = jpg.data[i]           // load next byte
+        nBits = 8                       // 8 bits now available in curByte
+
+        if curByte == 0xFF {
+            i++         // skip expected following 0x00
+            if i >= tLen-1 || jpg.data[i] != 0x00 {
+                i--     // backup for next marker and stop
+                if jpg.Mcu && jpg.Begin <= nMCUs && jpg.End >= nMCUs {
+                    fmt.Printf( "MCU=%d comp=%d du=%d,%d coef=0 offset=%#x [%#02x] " +
+                                "End of scan segment (found marker or RST)\n",
+                                nMCUs, sCompIndex, sComp.dURow, sComp.dUCol, i, curByte )
+                }
+
+                warning := false
+                for k := len(scan.sComps)-1; k >= 0; k-- {
+                    if scan.sComps[k].dUAnchor != 0 ||
+                       scan.sComps[k].dURow != 0 ||
+                       scan.sComps[k].dUCol != 0 ||
+                       scan.sComps[k].count != 0 {
+                        warning = true
+                        fmt.Printf( "Warning: incomplete component %d (%d rows):"+
+                                    " anchor %d (max %d) row %d col %d count %d\n",
+                                k, scan.sComps[k].nRows,
+                                scan.sComps[k].dUAnchor,
+                                scan.sComps[k].nUnitsRow,
+                                scan.sComps[k].dURow,
+                                scan.sComps[k].dUCol,
+                                scan.sComps[k].count )
+                    }
+                }
+                if warning {
+                    fmt.Printf( "MCU=%d comp=%d du=%d,%d coef=0 offset=%#x [%#02x] " +
+                                "Unexpected end of scan segment\n",
+                                nMCUs, sCompIndex, sComp.dURow, sComp.dUCol, i, curByte )
+                }
+                break                   // return condition
+            } else if padding {
+                panic( "Padding not at the end of entropy coded segment\n" )
+            }
+        }
+        for {                           // curbyte bit loop
+            if nBits == 0 || padding { continue encodedLoop } // need more bits
+
+            var decodedDC = int16(0)
+            var previousVal = (*dUnit)[0]
+
+            if (curByte & 0x80) == 0x80 {
+                decodedDC = 1 << scan.sABPl
+                (*dUnit)[0] |= decodedDC
+            }
+            if jpg.Mcu && jpg.Begin <= nMCUs && jpg.End >= nMCUs {
+                fmt.Printf(
+                    "MCU=%d comp=%d du=%d,%d coef=0 %s DC: previous=%d decoded=%d updated=%d\n",
+                    nMCUs, sCompIndex, sComp.dURow, sComp.dUCol,
+                    jpg.getBitString( i, 8 - nBits, 1 ),
+                    previousVal, decodedDC, (*dUnit)[0] )
+            }
+
+            curByte <<= 1
+            nBits --
+
+            sComp.dUCol++
+            if sComp.dUCol >= uint(sComp.HSF) {
+                sComp.dUCol = 0
+                sComp.dURow++
+                if sComp.dURow >= uint(sComp.VSF) {
+                    sComp.dURow = 0     // end of current component
+                    sComp.dUAnchor += uint(sComp.HSF) // ready for next du
+                    sCompIndex++
+                    if sCompIndex >= len(scan.sComps) {
+                        sCompIndex = 0
+                        nMCUs ++        // new MCU
+                    }
+                    //fmt.Printf("!!! Switching to component %d\n", sCompIndex)
+                    sComp = &scan.sComps[sCompIndex]
+                    if sComp.dUAnchor == sComp.nUnitsRow { // end of DU row
+                        if jpg.nMcuRST != 0 &&
+                           nMCUs % jpg.nMcuRST != 0 && jpg.Warn {
+                            fmt.Printf(
+                                "Warning: end of slice @MCU %d is "+
+                                "not synced with RST intervals (%d)\n",
+                                nMCUs, jpg.nMcuRST )
+                        }
+                        for sci := 0; sci < len(scan.sComps); sci++ {
+                            // new row for each component
+                            sc := &scan.sComps[sci]
+                            sc.nRows += uint(sc.VSF)
+                            sc.dUAnchor = 0
+                            sc.dURow = 0
+                            sc.dUCol = 0
+                            sc.count = 0
+                        }
+                    }
+                }
+            }
+            if len(*sComp.iDCTdata) > int(sComp.nRows+sComp.dURow) {
+                //fmt.Printf("Ready for next data unit: component %d anchor %d row %d col %d\n",
+                //           sCompIndex, sComp.dUAnchor, sComp.dURow, sComp.dUCol)
+                dUnit = &((*sComp.iDCTdata)[sComp.nRows+sComp.dURow][sComp.dUAnchor+sComp.dUCol])
+            } else {
+                fmt.Printf( "Reached end of pre-allocated data units\n" )
+                padding = true
+                dUnit = nil     // temporarily: force panic if any data is written afterwards
+            }
+        }   // end curbyte bit loop
+    }   // end encodedLoop
+
+    jpg.offset = i  // stopped at 0xFF followed by non-zero byte or at tLen-1
+    return nMCUs, nil
+}
+
+func (jpg *Desc) processInitialAcEcs( nMCUs uint, scan *scan ) (uint, error) {
+
+    if ( scan.startSS == 0 || scan.sABPh != 0 || len(scan.sComps) > 1 ) {
+        panic( "processInitialAcEcs called for wrong scan" )
+    }
+
+    fmt.Printf( "Entering processInitialAcEcs Approximation bits h=%d l=%d spectral selection start=%d end=%d\n",
+                scan.sABPh, scan.sABPl, scan.startSS, scan.endSS )
+
+    sComp := &scan.sComps[0]                    // single component definition
+    sComp.dUAnchor = nMCUs % sComp.nUnitsRow    // 1 MCU is 1 Data Unit
+    sComp.nRows = nMCUs / sComp.nUnitsRow       // dUCol & dURow are not used
+    sComp.count = scan.startSS                  // start at specific AC band
+
+    // restart where we stopped
+    dUnit := &((*sComp.iDCTdata)[sComp.nRows][sComp.dUAnchor])
+
+    huffman := true                     // always start with huffman code
+    var curHcnode = sComp.hAC           // always start with encoded AC
+
+    var curByte, nBits uint8            // hold current encoded bits
+    var runLen, size uint8              // current decoded runlength & size
+    var codeBit uint8                   // n bits in current code
+    var code uint                       // current code data
+    var nBlocks uint                    // number of block to skip
+
+    // encoded loop 1 byte at a time: start at 1st byte following header or RST
+    tLen := uint(len( jpg.data ))
+    i := jpg.offset
+
+    var huffbits uint8                  // number of bits encoding value (limited to 16)
+    var huffval uint                    // decoded value
+
+    // for pretty print formatting:
+    var startByte = i                   // offset of the first byte contributing to code
+    var startBit uint8                  // bit offset into startByte
+
+    var padding = false                 // indicates ongoing stuffing at end of ECS
+
+encodedLoop:
+    for ; i < tLen-1; i ++ {            // byte loop
+        curByte = jpg.data[i]           // load next byte
+        nBits = 8                       // 8 bits now available in curByte
+
+        if curByte == 0xFF {
+            i++         // skip expected following 0x00
+            if i >= tLen-1 || jpg.data[i] != 0x00 {
+                i--     // backup for next marker and stop
+                if jpg.Mcu && jpg.Begin <= nMCUs && jpg.End >= nMCUs {
+                    fmt.Printf( "MCU=%d comp=%d du=%d,%d coef=%d offset=%#x [%#02x] " +
+                                "End of scan segment (found marker or RST)\n",
+                                nMCUs, 0, sComp.nRows, sComp.dUAnchor,
+                                sComp.count, i, curByte )
+                }
+
+                if sComp.dUAnchor != 0 || sComp.count != scan.startSS {
+                    fmt.Printf( "MCU=%d comp=%d du=%d,%d coef=%d offset=%#x [%#02x] " +
+                                "Unexpected end of scan segment\n",
+                                nMCUs, 0, sComp.nRows, sComp.dUAnchor,
+                                sComp.count, i, curByte )
+                }
+                break                   // return condition
+            } else if padding {
+                panic( "Padding not at the end of entropy coded segment\n" )
+            }
+        }
+        for {                           // curbyte bit loop
+            if huffman {
+                for {                       // huffman bit loop (both DC & AC)
+                    if nBits == 0 {
+                        continue encodedLoop    // need more bits
+                    }
+                    if (curByte & 0x80) == 0x80 {
+                        curHcnode = curHcnode.left
+                        if curHcnode == nil {
+                            padding = true;     // maybe byte stuffing at the end
+                            fmt.Printf("possible padding curByte=0x%02x nBits=%d\n", curByte, nBits );
+                            for {
+                                nBits --
+                                if nBits == 0 {
+                                    if 0 == jpg.data[i] {
+                                        i++;    // unlikely 0xff00 before marker (skip)
+                                    }
+                                    continue encodedLoop    // end of ECS
+                                }
+                                curByte <<= 1
+                                if (curByte & 0x80) != 0x80 {
+                                    panic("Invalid code/huffman tree (left)\n")
+                                }
+                            }
+                        }
+                        huffval <<= 1
+                        huffval ++
+                    } else {
+                        curHcnode = curHcnode.right
+                        if curHcnode == nil { panic("Invalid code/huffman tree (right)\n") }
+                        huffval <<= 1
+                    }
+                    curByte <<= 1
+                    nBits --
+                    huffbits ++
+
+                    if curHcnode.left == nil && curHcnode.right == nil {
+                        runSize := curHcnode.symbol // if AC first 4 bits are
+                        runLen = runSize >> 4      // runlength, remaining 4
+                        size = runSize & 0x0f      // are size in all cases
+                        if jpg.Mcu && jpg.Begin <= nMCUs && jpg.End >= nMCUs {
+                            fmt.Printf( "MCU=%d comp=%d du=%d,%d coef=%d %s Huffman: " +
+                                        "size %d (0-runlength %d)\n",
+                                        nMCUs, 0, sComp.nRows, sComp.dUAnchor, sComp.count,
+                                        jpg.getBitString( startByte, startBit, uint(huffbits) ),
+                                        size, runLen )
+                        }
+                        huffval, huffbits, huffman = 0, 0, false
+                        codeBit, code = 0, 0
+                        nBlocks = 0
+                        break           // end huffman bit loop
+                    }
+                }
+            } else {                    // only AC coefficients
+//fmt.Printf("processInitialAcEcs: data Unit row %d col %d AC coef %d runlen %d size %d\n",
+//            sComp.dURow, sComp.dUCol, sComp.count, runLen, size )
+                if size == 0 {          // EOBn or ZRL
+                   if runLen == 15 {    // ZRL => 16 0s
+                        if jpg.Mcu && jpg.Begin <= nMCUs && jpg.End >= nMCUs {
+                            fmt.Printf(
+                            "MCU=%d comp=%d du=%d,%d coef=%d %s AC: ZRL => 16 bytes = 0\n",
+                            nMCUs, 0, sComp.nRows, sComp.dUAnchor, sComp.count,
+                            jpg.getBitString( startByte, startBit, 0 ) )
+                        }
+                        if sComp.count+15 > scan.endSS {
+                            return nMCUs, fmt.Errorf(
+                                  "processInitialAcEcs: ZRL over the end of spectral selection range\n")
+                        }
+//                        fmt.Printf( "AC coef %d ZRL%d next coef %d\n",
+//                                    sComp.count, sComp.count + 16)
+                        // just skip (not modified in any way)
+                        sComp.count += 16
+                    } else {            // EOBn n in [0..14] get following bits
+                        for ; codeBit < runLen; codeBit++ {
+                            if nBits == 0 { continue encodedLoop }  // need more bits
+
+//                        fmt.Printf( "[MCU=%d offset=%#x.%d] AC: codeBit=%d, size=%d, code=%#02x\n",
+//                                    nMCUs, i, 8-nBits, codeBit, size, code )
+                            code <<= 1
+                            if curByte & 0x80 == 0x80 {
+                                code += 1
+                            }
+                            curByte <<= 1
+                            nBits --
+                        }
+                        // do not change sComp.count
+                        nBlocks = (1 << runLen) + code
+                        if jpg.Mcu && jpg.Begin <= nMCUs && jpg.End >= nMCUs {
+                            fmt.Printf(
+                            "MCU=%d comp=%d du=%d,%d coef=%d %s AC: EOB%d for this data unit\n",
+                            nMCUs, 0, sComp.nRows, sComp.dUAnchor, sComp.count,
+                            jpg.getBitString( startByte, startBit, uint(runLen) ), runLen )
+                        }
+//                        fmt.Printf( "EOB%d code %d nBlocks %d\n", runLen, code, nBlocks)
+                    }
+                } else {                // not a special case, size is not 0
+                    if size > 10 {
+                        return nMCUs, fmt.Errorf(
+                        "processInitialAcEcs: AC coef size (%d) not in [1-10] bits\n",
+                              size)
+                    }
+                    for ; codeBit < size; codeBit++ {
+                        if nBits == 0 { continue encodedLoop }  // need more bits
+
+//                        fmt.Printf( "[MCU=%d offset=%#x.%d] AC: codeBit=%d, size=%d, code=%#02x\n",
+//                                    nMCUs, i, 8-nBits, codeBit, size, code )
+                        code <<= 1
+                        if curByte & 0x80 == 0x80 {
+                            code += 1
+                        }
+                        curByte <<= 1
+                        nBits --
+                    }
+                    decodedAC := rlCodes[size][code]
+
+                    if jpg.Mcu && jpg.Begin <= nMCUs && jpg.End >= nMCUs {
+                        fmt.Printf(
+                        "MCU=%d comp=%d du=%d,%d coef=%d %s AC: runlength %d decoded=%d\n",
+                        nMCUs, 0, sComp.nRows, sComp.dUAnchor, sComp.count,
+                        jpg.getBitString( startByte, startBit, uint(size) ),
+                        runLen, decodedAC )
+                    }
+
+                    if sComp.count+runLen > scan.endSS {  // need room for 1 + runLen
+                        return nMCUs, fmt.Errorf(
+                         "processInitialAcEcs: Runlength %d over the end of data uint\n",
+                         runLen)
+                    }
+                    sComp.count += runLen   // just skip (not modified in any way)
+
+                    // store decoded AC in next slot of current data unit
+                    (*dUnit)[sComp.count] = decodedAC << scan.sABPl
+//                    fmt.Printf( "AC coef %d code %d decodedAC %d after point transform %d\n",
+//                                sComp.count, code, decodedAC, decodedAC << scan.sABPl)
+                    sComp.count++
+                }
+                if sComp.count > scan.endSS {
+                    nBlocks = 1
+                }
+
+                if nBlocks > 0 {    // just skip (not modified in any way)
+
+                    for n := uint(0); n < nBlocks; n++ {
+                        if jpg.Control.Du && jpg.Begin <= nMCUs && jpg.End >= nMCUs {
+                            printDataUnit( dUnit )
+                        }
+                        nMCUs ++        // new MCU
+                        sComp.dUAnchor ++
+                        if sComp.dUAnchor >= sComp.nUnitsRow {   // end of DU row
+                            sComp.dUAnchor = 0
+                            sComp.nRows++
+
+                            if jpg.nMcuRST != 0 && nMCUs % jpg.nMcuRST != 0 && jpg.Warn {
+                                fmt.Printf( "Warning: end of slice @MCU %d is "+
+                                            "not synced with RST intervals (%d)\n",
+                                            nMCUs, jpg.nMcuRST )
+                            }
+                        }
+                        if len(*sComp.iDCTdata) > int(sComp.nRows) {
+//                            fmt.Printf("Ready for next data unit: row %d col %d\n",
+//                                        sComp.nRows, sComp.dUAnchor)
+                            dUnit = &((*sComp.iDCTdata)[sComp.nRows][sComp.dUAnchor])
+                        }
+                        sComp.count = scan.startSS  // new data unit
+                    }
+                }
+                huffman = true          // next huffman encoded value
+                curHcnode = sComp.hAC   // reset huffman root
+//                panic("Debug\n");
+            }
+
+            startBit = 8 - nBits    // remaining in curByte
+            if startBit == 8 {
+                startByte = i+1
+                startBit = 0
+            } else {
+                startByte = i
+            }
+//            fmt.Printf("startBit %d nBits %d\n", startBit, nBits)
+        }   // end curbyte bit loop
+    }   // end encodedLoop
+
+    jpg.offset = i  // stopped at 0xFF followed by non-zero byte or at tLen-1
+    return nMCUs, nil
+}
+
+func (jpg *Desc) processRefiningAcEcs( nMCUs uint, scan *scan ) (uint, error) {
+
+    if scan.startSS == 0 || scan.sABPh == 0 || len(scan.sComps) > 1 {
+        panic( "processRefiningAcEcs called for wrong scan" )
+    }
+
+    fmt.Printf( "Entering processRefiningAcEcs Approximation bits h=%d l=%d spectral selection start=%d end=%d\n",
+                scan.sABPh, scan.sABPl, scan.startSS, scan.endSS )
+
+    sComp := &scan.sComps[0]                    // single component definition
+    sComp.dUAnchor = nMCUs % sComp.nUnitsRow    // 1 MCU is 1 Data Unit
+    sComp.nRows = nMCUs / sComp.nUnitsRow       // dUCol & dURow are not used
+    sComp.count = scan.startSS                  // start at specific AC band
+
+    // restart where we stopped
+    dUnit := &((*sComp.iDCTdata)[sComp.nRows][sComp.dUAnchor])
+
+    huffman := true                     // always start with huffman code
+    var curHcnode = sComp.hAC           // always start with encoded AC
+
+    var curByte, nBits uint8            // hold current encoded bits
+    var runLen, size uint8              // current decoded runlength & size
+    var codeBit uint8                   // n bits in current code
+    var code uint                       // current code data
+    var nBlocks uint                    // number of block to skip
+    var block uint                      // current block
+
+    // encoded loop 1 byte at a time: start at 1st byte following header or RST
+    tLen := uint(len( jpg.data ))
+    i := jpg.offset
+
+    var huffbits uint8                  // number of bits encoding value (limited to 16)
+    var huffval uint                    // decoded runlength-size
+
+    var decodedAc int16                 // decoded AC coefficient before point transform
+    var padding = false                 // indicates ongoing stuffing at end of ECS
+
+    // for pretty print formatting:
+    var startByte = i                   // offset of the first byte contributing to code
+    var startBit uint8                  // bit offset into startByte
+
+    var checked, skipped uint8          // how many coefs in uint have been checked/skipped
+                                        // in a regular run (limited to 63 coefficients)
+    var updated uint                    // how many coefs have been updated in an EOBn run
+
+    var eobRow, eobCol uint             // saved start row, col for EOBn display
+    var eobCoef uint8                   // saved starting coefficient for EOBn display
+
+encodedLoop:
+    for ; i < tLen-1; i ++ {            // byte loop
+        curByte = jpg.data[i]           // load next byte
+        nBits = 8                       // 8 bits now available in curByte
+//fmt.Printf(">>> Read curByte 0x%02x (nBits = 8) @offset 0x%04x\n", curByte, i )
+        if curByte == 0xFF {
+            i++         // skip expected following 0x00
+            if i >= tLen-1 || jpg.data[i] != 0x00 {
+                i--     // backup for next marker and stop
+                if jpg.Mcu && jpg.Begin <= nMCUs && jpg.End >= nMCUs {
+                    fmt.Printf( "MCU=%d comp=%d du=%d,%d coef=%d offset=%#x [%#02x] " +
+                                "End of scan segment (found marker or RST)\n",
+                                nMCUs, 0, sComp.nRows, sComp.dUAnchor,
+                                sComp.count, i, curByte )
+                }
+
+                if sComp.dUAnchor != 0 || sComp.count != scan.startSS {
+                    fmt.Printf( "MCU=%d comp=%d du=%d,%d coef=%d offset=%#x [%#02x] " +
+                                "Unexpected end of scan segment\n",
+                                nMCUs, 0, sComp.nRows, sComp.dUAnchor,
+                                sComp.count, i, curByte )
+                }
+                break                   // return condition
+            } else if padding {
+                panic( "processRefiningAcEcs: Padding not at the end of entropy coded segment\n" )
+            }
+        }
+        for {                           // curbyte bit loop
+            if huffman {
+                for {                       // huffman bit loop - AC only
+                    if nBits == 0 {
+                        continue encodedLoop    // need more bits
+                    }
+                    if (curByte & 0x80) == 0x80 {
+                        curHcnode = curHcnode.left
+                        if curHcnode == nil {
+                            padding = true;     // maybe byte stuffing at the end
+                            fmt.Printf("possible padding curByte=0x%02x nBits=%d\n", curByte, nBits );
+                            for {
+                                nBits --
+                                if nBits == 0 {
+                                    if 0 == jpg.data[i] {
+                                        i++;    // unlikely 0xff00 before marker (skip)
+                                    }
+                                    continue encodedLoop    // end of ECS
+                                }
+                                curByte <<= 1
+                                if (curByte & 0x80) != 0x80 {
+                                    panic("processRefiningAcEcs: Invalid code/huffman tree (left)\n")
+                                }
+                            }
+                        }
+                        huffval <<= 1
+                        huffval ++
+                    } else {
+                        curHcnode = curHcnode.right
+                        if curHcnode == nil { panic("processRefiningAcEcs: Invalid code/huffman tree (right)\n") }
+                        huffval <<= 1
+                    }
+                    curByte <<= 1
+                    nBits --
+                    huffbits ++
+
+                    if curHcnode.left == nil && curHcnode.right == nil {
+                        runSize := curHcnode.symbol // if AC first 4 bits are
+                        runLen = runSize >> 4      // runlength, remaining 4
+                        size = runSize & 0x0f      // are size in all cases
+                        if jpg.Mcu && jpg.Begin <= nMCUs && jpg.End >= nMCUs {
+                            fmt.Printf( "MCU=%d comp=%d du=%d,%d coef=%d %s Huffman: " +
+                                        "size %d (0-runlength %d)\n",
+                                        nMCUs, 0, sComp.nRows, sComp.dUAnchor, sComp.count,
+                                        jpg.getBitString( startByte, startBit, uint(huffbits) ),
+                                        size, runLen )
+                        }
+                        huffval, huffbits, huffman = 0, 0, false
+
+                        // will be used for subsequent decoding
+                        codeBit, code = 0, 0
+                        skipped, checked = 0, 0
+                        nBlocks, block = 0, 0
+
+                        break           // end huffman bit loop
+                    }
+                }
+            } else {                        // only AC coefficients
+                if nBlocks == 0 {
+//    fmt.Printf("processRefiningAcEcs: data Unit row %d col %d AC coef %d runlen %d size %d\n",
+//                sComp.dURow, sComp.dUCol, sComp.count, runLen, size )
+                    if size == 0 {          // EOBn or ZRL
+                       if runLen == 15 {    // ZRL => 16 0s
+                            if checked == 0 && sComp.count+16 > 64 {
+                                return nMCUs, fmt.Errorf(
+                                      "processRefiningAcEcs: ZRL over the end of data unit\n")
+                            }
+
+                            for ; skipped < 16; checked ++ {
+                                pVal := (*dUnit)[sComp.count+checked]
+                                if pVal != 0 {
+                                    if nBits == 0 { continue encodedLoop }  // need more bits
+
+                                    if curByte & 0x80 == 0x80 {
+                                        if pVal > 0 {
+                                            (*dUnit)[sComp.count+checked] += 1 << scan.sABPl
+                                        } else {
+                                            (*dUnit)[sComp.count+checked] += -1 << scan.sABPl
+                                        }
+                                        code += 1     // for MCU pretty print
+                                    }
+                                    code <<= 1
+                                    curByte <<= 1
+                                    nBits --
+                                } else {
+                                    skipped ++  // only incremented if pval is 0
+                                }
+                            }
+
+                            if jpg.Mcu && jpg.Begin <= nMCUs && jpg.End >= nMCUs {
+                                fmt.Printf(
+                                "MCU=%d comp=%d du=%d,%d coef=%d %s AC: ZRL => skipped/refined %d coefs\n",
+                                nMCUs, 0, sComp.nRows, sComp.dUAnchor, sComp.count,
+                                jpg.getBitString( startByte, startBit, uint(checked - skipped) ),
+                                checked )
+                            }
+//                            fmt.Printf( "AC coef %d ZRL next coef %d\n", sComp.count, sComp.count + 16)
+                            sComp.count += checked
+
+                        } else {            // EOBn n in [0..14] get following bits
+                            for ; codeBit < runLen; codeBit++ {
+                                if nBits == 0 { continue encodedLoop }  // need more bits
+
+                                code <<= 1
+                                if curByte & 0x80 == 0x80 {
+                                    code += 1
+                                }
+                                curByte <<= 1
+                                nBits --
+                            }
+                            // do not change sComp.count here since it will be 
+                            // updated when processing nBlocks below.
+                            nBlocks = (1 << runLen) + code
+//    fmt.Printf( "EOB%d runLen %d, startBit %d, code %d nBlocks %d\n",
+//                 runLen, runLen, startBit, code, nBlocks)
+                            updated = 0
+                            eobRow = sComp.nRows        // EOBn references
+                            eobCol = sComp.dUAnchor     // (modified during EOBn)
+                            eobCoef = sComp.count
+                        }
+                    } else {                // size should be 1
+//    fmt.Printf("Zero run: codeBit %d, size %d, start @ %d runLen %d\n",
+//                codeBit, size, sComp.count, runLen )
+
+                        if codeBit == 0 {       // indicates uknown coefficient sign
+                            if size > 1 {
+                                return nMCUs, fmt.Errorf(
+                                "processRefiningAcEcs: AC coef size (%d) not 0 or 1\n",
+                                  size)
+                            }
+                            if sComp.count+runLen > scan.endSS { // need room for 1 + runLen
+                                return nMCUs, fmt.Errorf(
+                                 "processRefiningAcEcs: Runlength %d over the end of data uint\n",
+                                 runLen)
+                            }
+//    fmt.Printf("curByte 0x%02x, nBits %d\n", curByte, nBits)
+                            // get the following sign bit into code
+                            if nBits == 0 { continue encodedLoop }  // need more bits
+                            // code is actually the sign bit, 0 means -1, 1 means +1
+                            if curByte & 0x80 == 0x80 {
+                                decodedAc = 1
+                                code = 1
+                            } else {
+                                decodedAc = -1
+                                code = 0
+                            }
+//    fmt.Printf("    code %d decodedAc %d\n", code, decodedAc )
+                            curByte <<= 1
+                            nBits --
+                            codeBit = 1    // coefficient sign in decodedAc
+                        }
+
+                        // check each coefficient in the zero run. If 0, just skip
+                        // it. If non zero, read one more bit from the stream and
+                        // if that bit is 1 just add 1 << scan.sABPl, otherwise
+                        // just leave that coefficient unchanged. In both cases,
+                        // move to next coefficient without incrementing skip.
+                        // After ending the zero run (skipped == runLen), as long
+                        // as the following coefficients are non-zero keep refining
+                        // them by reading more bits in the steam, until we reach a
+                        // zero coefficient. At that point store the newly extracted
+                        // code into that coefficient.
+//    fmt.Printf("Zero run: start @ %d, runLen %d\n", sComp.count, runLen)
+                        for ; ; checked ++ {    // zero & non-zero coefs
+                            pVal := (*dUnit)[sComp.count+checked]
+                            if pVal != 0 {      // non-zero coef only
+//    fmt.Printf("Updating coefficient %d, curByte 0x%02x, nBits %d\n",
+//                sComp.count+checked, curByte, nBits )
+                                if nBits == 0 { continue encodedLoop }  // need more bits
+
+                                if curByte & 0x80 == 0x80 {
+                                    if pVal > 0 {
+                                        (*dUnit)[sComp.count+checked] += 1 << scan.sABPl
+                                    } else {
+                                        (*dUnit)[sComp.count+checked] += -1 << scan.sABPl
+                                    }
+                                }
+                                curByte <<= 1
+                                nBits --
+                            } else {            // zero coeff only
+                                if runLen == skipped {
+                                    break
+                                }
+                                skipped ++
+                            }
+                        }
+//    fmt.Printf("moving to coef %d (checked %d) end @ %d\n",
+//                sComp.count+checked, checked, scan.endSS )
+
+                        if jpg.Mcu && jpg.Begin <= nMCUs && jpg.End >= nMCUs {
+                            fmt.Printf(
+                            "MCU=%d comp=%d du=%d,%d coef=%d %s AC: runlength %d updated %d coefs, decoded=%d\n",
+                            nMCUs, 0, sComp.nRows, sComp.dUAnchor, sComp.count,
+                            jpg.getBitString( startByte, startBit, uint(checked-skipped) + 1 ),
+                            runLen, checked-skipped, decodedAc )
+                        }
+                        sComp.count += checked
+                        // store decoded AC in next slot of current data unit
+                        (*dUnit)[sComp.count] = decodedAc << scan.sABPl
+//                        fmt.Printf( "AC coef %d code %d decodedAC %d after point transform %d\n",
+//                                    sComp.count, code, decodedAC, decodedAC << scan.sABPl)
+                        sComp.count ++
+                    }
+                }
+//                fmt.Printf( "end non huffman case: nBlocks=%d, sComp.count=%d\n",
+//                            nBlocks, sComp.count );
+
+                if nBlocks > 0 {   // update non-zero data units in the way
+                    for ; block < nBlocks; block++ {    // block loop
+//    fmt.Printf("Block loop %d (stop@%d) coefs from %d to %d\n", block, nBlocks, sComp.count, scan.endSS)
+                        for ; sComp.count <= scan.endSS; sComp.count++ { // coef loop
+                            pVal := (*dUnit)[sComp.count]
+//    fmt.Printf("  Coefficient %d pVal=%d curByte=0x%02x, nBits=%d\n", sComp.count, pVal, curByte, nBits )
+                            if pVal != 0 {      // non-zero coef only
+                                if nBits == 0 {
+//                                    fmt.Printf("Block loop %d need more bits @coef %d\n", block, sComp.count)
+                                    continue encodedLoop }  // need more bits
+
+                                if curByte & 0x80 == 0x80 {
+                                    if pVal > 0 {
+                                        (*dUnit)[sComp.count] += 1 << scan.sABPl
+                                    } else {
+                                        (*dUnit)[sComp.count] += -1 << scan.sABPl
+                                    }
+                                }
+//                                fmt.Printf("  Updating Coef %d curByte=0x%02x, nBits=%d\n",
+//                                              sComp.count, curByte, nBits )
+                                curByte <<= 1
+                                nBits --
+                                updated ++
+                            }
+                        }   // end of DU loop
+
+                        if jpg.Control.Du && jpg.Begin <= nMCUs && jpg.End >= nMCUs {
+                            printDataUnit( dUnit )
+                        }
+
+                        nMCUs ++            // next MCU (MCU == DU)
+                        sComp.dUAnchor ++
+                        if sComp.dUAnchor >= sComp.nUnitsRow {   // end of DU row
+                            sComp.dUAnchor = 0
+                            sComp.nRows++
+                        }
+
+//                        fmt.Printf( "Next data unit row: %d col: %d (nUnitsRow %d)\n",
+//                                    sComp.nRows, sComp.dUAnchor, sComp.nUnitsRow )
+
+                        if jpg.nMcuRST != 0 && nMCUs % jpg.nMcuRST != 0 && jpg.Warn {
+                            fmt.Printf( "Warning: end of slice @MCU %d is "+
+                                        "not synced with RST intervals (%d)\n",
+                                        nMCUs, jpg.nMcuRST )
+                        }
+
+                        if len(*sComp.iDCTdata) > int(sComp.nRows) {
+    //                        fmt.Printf("Ready for next data unit: row %d col %d\n",
+    //                                   sComp.nRows, sComp.dUAnchor)
+                            dUnit = &((*sComp.iDCTdata)[sComp.nRows][sComp.dUAnchor])
+                        }
+                        sComp.count = scan.startSS  // new data unit
+                    }
+                    if jpg.Mcu && jpg.Begin <= nMCUs && jpg.End >= nMCUs {
+                        fmt.Printf(
+                        "MCU=%d comp=%d du=%d,%d coef=%d %s AC: EOB%d updated %d\n",
+                        nMCUs, 0, eobRow, eobCol, eobCoef,
+                        jpg.getBitString( startByte, startBit, uint(runLen) + updated ),
+                        runLen, updated )
+                    }
+                } else if sComp.count >= scan.endSS {
+                    nMCUs ++                // next MCU/data Unit
+                    sComp.dUAnchor ++
+                    if sComp.dUAnchor >= sComp.nUnitsRow {   // end of DU row
+                        sComp.dUAnchor = 0
+                        sComp.nRows++
+                    }
+
+                    if jpg.nMcuRST != 0 && nMCUs % jpg.nMcuRST != 0 && jpg.Warn {
+                        fmt.Printf( "Warning: end of slice @MCU %d is "+
+                                    "not synced with RST intervals (%d)\n",
+                                    nMCUs, jpg.nMcuRST )
+                    }
+                    if len(*sComp.iDCTdata) > int(sComp.nRows) {
+    //                    fmt.Printf("Ready for next data unit: row %d col %d\n",
+    //                               sComp.nRows, sComp.dUAnchor)
+                        dUnit = &((*sComp.iDCTdata)[sComp.nRows][sComp.dUAnchor])
+                    }
+                    sComp.count = scan.startSS  // new data unit
+                }
+//fmt.Printf("<<< Reentering huffman with curByte 0x%02x nBits %d\n", curByte, nBits)
+                huffman = true          // next huffman encoded value
+                curHcnode = sComp.hAC   // reset huffman root
+            }
+
+            startBit = 8 - nBits    // remaining in curByte
+            if startBit == 8 {
+                startByte = i+1
+                startBit = 0
+            } else {
+                startByte = i
+            }
+//            fmt.Printf("startBit %d nBits %d\n", startBit, nBits)
+        }   // end curbyte bit loop
+    }   // end encodedLoop
+
+    jpg.offset = i  // stopped at 0xFF followed by non-zero byte or at tLen-1
+    return nMCUs, nil
+}
+
+func (jpg *Desc) SkipECS( nMCUs uint, scan *scan ) (uint, error) {
+
+    fmt.Printf( "Entering SkipECS Approximation bits h=%d l=%d spectral selection start=%d end=%d\n",
+                scan.sABPh, scan.sABPl, scan.startSS, scan.endSS )
+    var curByte uint8
+    tLen := uint(len( jpg.data ))
+    i := jpg.offset
+
+    for ; i < tLen-1; i ++ {            // byte loop
+        curByte = jpg.data[i]           // load next byte
+
+        if curByte == 0xFF {
+            i++         // skip expected following 0x00
+            if i >= tLen-1 || jpg.data[i] != 0x00 {
+                i--     // backup for next marker and stop
+                break                   // return condition
+            }
+        }
+    }
     jpg.offset = i  // stopped at 0xFF followed by non-zero byte or at tLen-1
     return nMCUs, nil
 }

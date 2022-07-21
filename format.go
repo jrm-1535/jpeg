@@ -23,6 +23,10 @@ func (j *Desc)FormatImageInfo( w io.Writer ) (n int, err error) {
     return
 }
 
+type Component struct {
+    Id, HSF, VSF, QS uint8
+}
+
 type FrameInfo struct {
     Mode            EncodingMode    // baseline, sequential, progressive, lossless
     Entropy         EntropyCoding   // Huffman or arithmetic coding
@@ -48,8 +52,12 @@ func (j *Desc)GetFrameInfo( frame int ) (*FrameInfo, error) {
     fi.Height = uint(frm.actualLines( ))
 
     fi.Components = make( []Component, len(frm.components) )
-    copy( fi.Components, frm.components )
-
+    for i, cmp := range frm.components {
+        fi.Components[i].Id = cmp.Id
+        fi.Components[i].Id = cmp.HSF
+        fi.Components[i].Id = cmp.VSF
+        fi.Components[i].Id = cmp.QS
+    }
     return fi, nil
 }
 
@@ -420,25 +428,20 @@ func (j *Desc)FormatMetadata( w io.Writer, appId int, sIds []int ) (n int, err e
 
 func (j *Desc)FormatFrameComponent( w io.Writer,
                                     frame, comp uint ) (n int, err error) {
-    frs := j.getFrameSegment( frame )
-    if frs == nil {
+    frm := j.getFrameSegment( frame )
+    if frm == nil {
         return 0, fmt.Errorf( "FormatFrameComponent: frame %d is absent\n",
                               frame )
     }
-    if len(frs.scans) != 2 {    // 1 more than actually in use
-        return 0, fmt.Errorf( "FormatFrameComponent: only 1 scan is supported\n" )
-    }
 
-    scan := frs.scans[0]
-    mcu := scan.mcuD
-    if comp >= uint(len(mcu.sComps)) {
+    if comp >= uint(len(frm.components)) {
         return 0, fmt.Errorf( "FormatFrameComponent: component %d not available\n",
                               comp )
     }
-    sc := mcu.sComps[comp]
+    cmp := &frm.components[comp]
     cw := newCumulativeWriter( w )
     cw.format( "Frame %d, Component %d: %d rows of %d data units\n",
-               frame, comp, len(sc.iDCTdata), len(sc.iDCTdata[0]) );
+               frame, comp, len(cmp.iDCTdata), len(cmp.iDCTdata[0]) );
     n, err = cw.result()
 /*
     var du = dataUnit{

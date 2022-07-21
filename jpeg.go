@@ -42,7 +42,7 @@ Non-hierarchical mode:
             optionally followed by multiple other scan segments, each without
             a DNL segment:
 
-            SOFn <scan segment #1>[DNL][<scan segment #2>...<last scan segment>
+            SOFn <scan segment #1>[DNL][<scan segment #2>...<last scan segment>]
 
             A Frame header is a start of frame (SOFn): 0xffCn, where n is from
             0 to 15, minus multiples of 4 (SOF4, SOF8 and SOF12 do not exist).
@@ -75,10 +75,10 @@ Non-hierarchical mode:
                 [<optional tables>] SOS ECS [DNL] [RST0 ECS]...[RSTn ECS]
 
             RSTn indicates one restart interval from RST0 to RST7, starting
-            from 0 and incrementing before wrapping around.
+            from 0 and incrementing until it wraps around.
 
             A scan header segment is start of scan (SOS) segment: 0xffda with
-            the following synrax
+            the following syntax:
                 SOS, 2 byte size, 1 byte number of components in scan,
                 followed for each of those components:
                     1 byte component selector (in theory must match one of the
@@ -87,8 +87,8 @@ Non-hierarchical mode:
                            the order of components in the fram header - YCbCr).
                     4 bit  DC entropy coding table selector
                     4 bit  AC entropy coding table selector
-                    1 byte start of spectral or predictor selectopn
-                    1 byte end of spectral or predictor selectopn
+                    1 byte start of spectral or predictor selection
+                    1 byte end of spectral or predictor selection
                     4 bit successive approximation bit position high
                     4 bit successive approximation bit position low
 
@@ -156,35 +156,47 @@ func (jpg *Desc) getJPEGStateName( ) string {
     return stateNames[ jpg.state ]
 }
 
-type dataUnit       [64]int16
-type iDCTRow        []dataUnit  // dequantizised iDCT matrices (yet to inverse)
-
 type scanComp struct {
     hDC, hAC        *hcnode     // huffman roots for DC and AC coefficients
-                                // use hDC for 1st sample, hAC for all others
-    dUnits          []dataUnit  // up to vSF rows of hSF data units (64 int)
-    iDCTdata        []iDCTRow   // rows of reordered idata unit before iDCT
-    previousDC      int16       // previous DC value for this component
-    nUnitsRow       uint        // n units per row = nSamplesLines/8
-    hSF, vSF        uint        // horizontal & vertical sampling factors
-    dUCol           uint        // increments with each dUI till it reaches hSF
-    dURow           uint        // increments with each row till it reaches vSF
-    dUAnchor        uint        // top-left corner of dUnits area, incremented
-                                // by hSF each time hSF*vSF data units are done
-    nRows           uint        // number of rows already processed
-    count           uint8       // current sample count [0-63] in each data unit
-    cId             uint8       // component id from _SOS
-    dcId, acId      uint8       // entropy table ids for DC & AC coefficients
-    quId, quSz      uint8       // quantization table id and size
-}
+    iDCTdata        *[]iDCTRow  // reference to the frame component data units
 
-type mcuDesc struct {           // Minimum Coded Unit Descriptor
-    sComps           []scanComp // one per scan component in order: Y, [Cb, Cr]
+    previousDC      int16       // previous DC value for this component
+    count           uint8       // current coefficient count [0-63] in each data unit
+
+    // in case of non-interleaved scans, dUCol and dURow are always 0, whereas
+    // dUAnchor is the actual column number and nRows is the row number (only
+    // one data unit per MCU). In case of interleaved scans, for the component
+    // with the maximum number of horizontal samples dUCol increments from 0 to
+    // HSF-1 and dURow increments from 0 to VSF-1 before dUAnchor increments.
+    // In all cases, the actual column number is duAnchor + duCol and the actual
+    // row number is nROws + dURow.
+    dUCol           uint        // increments with each dUI till it reaches HSF
+    dURow           uint        // increments with each row till it reaches VSF
+    dUAnchor        uint        // top-left corner of dUnits area, incremented
+                                // by HSF each time HSF*VSF data units are done
+    nRows           uint        // number of rows already processed
+
+    // in case of non-interleaved scans (single component per scan), the
+    // following values differ from their cmp counterparts (nUnitsRow, HSF &
+    // VSF, which are assumed to work only in interleaved scans). In particular,
+    // both HSF and VSF are set to 1, regardless of the component HSF and VSF.
+    // Similarly, if the component HSF is 2 or more, the number of data units
+    // in a row must be a multiple of HSF (only full MCUs are possible in case
+    // of interleaved scans) whereas a non-interleaved scan can end at the first
+    // data unit (8 samples) that is sufficient to provide the required number
+    // of samples per lines in the frame. This is useful in progressive frames
+    // where both interleaved and non-interleaved scans are present.
+    nUnitsRow       uint        // n data units in each sample row
+    HSF, VSF        uint8       // n units in each MCU row and col respectively
+
+    dcId, acId      uint8       // huffman table ids for DC and AC
+    cId             uint8       // component Id (matching frame component Ids)
+    cType           uint8       // component type (0=Y, 1=Cb or 2=Cr)
 }
 
 type scan   struct {            // one for each scan
     ECSs            []byte      // entropy coded segments constituting the scan
-    mcuD            *mcuDesc    // MCU definition for the scan
+    sComps          []scanComp  // one per scan component
     nMcus           uint        // total number of MCUs in scan
     rstInterval     uint        // nMCUs between restart intervals
     rstCount        uint        // total number of restart in the scan
@@ -208,8 +220,13 @@ type hdef struct {
     root            *hcnode
 }
 
-type Component struct {
+type dataUnit       [64]int16
+type iDCTRow        []dataUnit  // iDCT matrices
+
+type component struct {
     Id, HSF, VSF, QS uint8
+    nUnitsRow       uint        // n data units per row (see iDCTRow)
+    iDCTdata        []iDCTRow   // component data units (in full frame)
 }
 
 type Encoding  uint
@@ -309,7 +326,7 @@ type frame struct {             // one for each SOFn
     id              uint        // frame number [0..n] in appearance order
     encoding        Encoding    // how the frame is encoded
     resolution      sampling
-    components      []Component // from SOFn component definitions
+    components      []component // from SOFn component definitions
                                 // note: component order is Y [, Cb, Cr] in SOFn
     scans           []scan      // for the scans following SOFn
     image           *Desc       // access to global image parameters
@@ -391,8 +408,6 @@ func (cw *cumulativeWriter)result( ) (int, error) {
 // Desc is the internal structure describing the JPEG file
 type Desc struct {
     data            []byte      // raw data file
-    update          []byte      // modified data (only if fix is true and issues
-                                // are encountered)
     offset          uint        // current offset in raw data file
     state           int         // INIT, APP, FRAME, SCAN1, SCAN1_ECS, SCANn,
                                 // SCANn_ECS, FINAL
@@ -785,7 +800,7 @@ func (jpg *Desc) GetImageOrientation( ) (*Orientation, error) {
     return jpg.orientation, nil
 }
 
-func make8BitComponentArrays( cmps []scanComp ) [](*[]uint8) {
+func make8BitComponentArrays( cmps []component ) [](*[]uint8) {
 
     cArrays := make( [](*[]uint8), len( cmps ) ) // one flat []byte par component
 
@@ -816,12 +831,14 @@ func (jpg *Desc) MakeFrameRawPicture( frame int ) ([](*[]uint8), error) {
         return nil, fmt.Errorf( "MakeFrameRawPicture: frame %d is absent\n", frame )
     }
     frm := jpg.frames[frame]
-    sc := frm.scans[0]
-    if sc.mcuD == nil || len(sc.mcuD.sComps) == 0 {
-        return nil, fmt.Errorf( "MakeFrameRawPicture: no scan available for picture\n" )
+    if len( frm.scans ) < 1 {
+        return nil, fmt.Errorf( "SaveRawPicture: no scan available for picture\n" )
+    }
+    if err := jpg.dequantize( &frm ); err != nil {
+        return nil, err
     }
 
-    cmps := sc.mcuD.sComps
+    cmps := frm.components
     var samples [](*[]uint8)
     switch frm.resolution.samplePrecision {
     case 8:
@@ -833,11 +850,11 @@ func (jpg *Desc) MakeFrameRawPicture( frame int ) ([](*[]uint8), error) {
 }
 
 const writeBufferSize = 1048576
-func (jpg *Desc) writeBW( f *os.File, samples [](*[]uint8), sComps []scanComp,
+func (jpg *Desc) writeBW( f *os.File, samples [](*[]uint8), cmps []component,
                           o *Orientation ) (nc, nr uint, n int, err error) {
 
     Y := samples[0]
-    yStride := sComps[0].nUnitsRow << 3
+    yStride := cmps[0].nUnitsRow << 3
 
     bw := bufio.NewWriterSize( f, writeBufferSize )
     cbw := newCumulativeWriter( bw )
@@ -931,7 +948,7 @@ func (jpg *Desc) writeBW( f *os.File, samples [](*[]uint8), sComps []scanComp,
     return
 }
 
-func (jpg *Desc) writeYCbCr( f *os.File, samples [](*[]uint8), sComps []scanComp,
+func (jpg *Desc) writeYCbCr( f *os.File, samples [](*[]uint8), cmps []component,
                              o *Orientation ) (nc, nr uint, n int, err error) {
     if len(samples) != 3 {
         panic("writeYCbCr: incorrect number of components\n")
@@ -941,17 +958,17 @@ func (jpg *Desc) writeYCbCr( f *os.File, samples [](*[]uint8), sComps []scanComp
     Cb := samples[1]
     Cr := samples[2]
 
-    yHSF := sComps[0].hSF
-    yVSF := sComps[0].vSF
-    yStride := sComps[0].nUnitsRow << 3 
+    yHSF := uint(cmps[0].HSF)
+    yVSF := uint(cmps[0].VSF)
+    yStride := cmps[0].nUnitsRow << 3
 
-    CbHSF := sComps[1].hSF
-    CbVSF := sComps[1].vSF
-    CbStride := sComps[1].nUnitsRow << 3 
+    CbHSF := uint(cmps[1].HSF)
+    CbVSF := uint(cmps[1].VSF)
+    CbStride := cmps[1].nUnitsRow << 3
 
-    CrHSF := sComps[2].hSF
-    CrVSF := sComps[2].vSF
-    CrStride := sComps[2].nUnitsRow << 3 
+    CrHSF := uint(cmps[2].HSF)
+    CrVSF := uint(cmps[2].VSF)
+    CrStride := cmps[2].nUnitsRow << 3
 //fmt.Printf("yHSF %d, CbHSF %d, CrHSF %d, yVSF %d, CbVSF %d, CrVSF %d, CbStride %d, CrStride %d\n",
 //            yHSF, CbHSF, CrHSF, yVSF, CbVSF, CrVSF, CbStride, CrStride )
     bw := bufio.NewWriterSize( f, writeBufferSize )
@@ -1066,7 +1083,6 @@ func (jpg *Desc) writeYCbCr( f *os.File, samples [](*[]uint8), sComps []scanComp
     return
 }
 
-
 func (jpg *Desc) SaveRawPicture( path string, bw bool,
                                  ort *Orientation ) ( nCols, nRows uint,
                                                       n int, err error) {
@@ -1074,15 +1090,18 @@ func (jpg *Desc) SaveRawPicture( path string, bw bool,
         return 0, 0, 0, fmt.Errorf( "SaveRawPicture: no frame to save\n" )
     }
     if len(jpg.frames) > 1 {
-        return 0, 0, 0, fmt.Errorf( "SaveRawPicture: multiple framre are not supported\n" )
+        return 0, 0, 0, fmt.Errorf( "SaveRawPicture: multiple frames are not supported\n" )
     }
     frm := jpg.frames[0]
-    sc := frm.scans[0]
-    if sc.mcuD == nil || len(sc.mcuD.sComps) == 0 {
+    if len( frm.scans ) < 1 {
         return 0, 0, 0, fmt.Errorf( "SaveRawPicture: no scan available for picture\n" )
     }
 
-    cmps := sc.mcuD.sComps
+    if err = jpg.dequantize( &frm ); err != nil {
+        return 0, 0, 0, err
+    }
+
+    cmps := frm.components
     var samples [](*[]uint8)
     switch frm.resolution.samplePrecision {
     case 8:

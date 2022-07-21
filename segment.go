@@ -8,30 +8,50 @@ import (
 )
 
 /*
-    MCU is Minimum Coded Unit
+    A picture is split into small squares of 8 * 8 pixels. In the usual case of
+    color pictures, the image is made of pixels with 3 components, Luminance Y
+    and 2 Chrominance (Cb, Cr) values. Each 8 * 8 pixel block is then split in
+    data units, where each data unit is made of a single component samples,
+    64 samples in a square
 
-    If the image is grayscale, MCU is just one data unit (8*8 samples)
-    if the image is Luminance Y and 2 Chrominance (Cb, Cr) values, MCU may
-    be a series of Y, Cb, Cr data units in case of a single interleaved
-    scan, or just a single data unit in case of a several separate scans
-    of non-interleaved data units.
+    An image may be received as a single scan that includes pixels of those 3
+    components (interleaved data units) or as multiple scans, each including
+    only pixels from one component (non-interleaved data units). If the image
+    is grayscale, there is only 1 component Y and the scan is non-interleaved.
 
-    In case of interleaved data units, MCU gives the number of data units 
-    included in the MCU and for each data unit the relative location of the
+    MCU is the Minimum Coded Unit in scan Entropy Coded Segments (ECS). Each
+    MCU describes the number and location of encoded data units.
+
+    If the scan is non-interleaved, one MCU is just one data unit (64 samples),
+    otherwise it is a series of Y, Cb, Cr data units. MCU gives the number of
+    included data units and for each data unit the relative location of the
     data unit in the complete image.
+
+    Because scans are made of complete data units, and even if the number of
+    lines or the number of samples per line in the frame is not a multiple of
+    8, a scan must include samples for all data units than start within the
+    image. The location of each data unit is given by its row and column. In
+    case of interleaved data units, component resolutions may differ and for
+    example the luminance component may require more data units than other
+    chrominance components. In that case each MCU includes more Y data units
+    than Cb or Cr data units, and the MCU "position" in the image is defined
+    by its anchor.
 
     For example, in the typical case of 4, 2, 0 chroma subsampling, the first
     4 data units are LUMA (the first in the current luma anchor location, the
     second in the current luma anchor location + 1 on the same row, the third
     in the current luma anchor location on the row below and the fourth in the
-    current luma anchor locatiopn + 1 on the row below), the fifth is chroma
-    Cb (in the current Cb amchor location) and the sixth is the chroma Cr (in
-    the current Cb anchor location). Once a MCU is completed, luma anchor
-    location in incremented by 2 in both column and row, whereas both Cb and Cr
-    anchor locations are just incremented in column, until the end of their row.
+    current luma anchor location + 1 on the row below), the fifth is chroma
+    Cb (in the current Cb anchor location) and the sixth is the chroma Cr (in
+    the current Cb anchor location). Once a MCU is completed, the luma anchor
+    location in incremented by two in column, whereas both Cb and Cr anchor
+    locations are incremented by one in column, until the end of their row.
 
-    The end of row is the number of data units per line, that is:
-        samples/line/sizeof(dataUnitRow) = samples/lines/8
+    In case of interleaved scans, for each component the end of row is the
+    number of component data units per line, that is:
+        ceiling( samples per line * comp HSF / ( max HSF * 8 ) )
+    Were comp HSF stands for the component horizontal sampling factor and
+    max HSF for the maximum horizontal samplig factor of all components.
 
     However, sometimes the value of samples/line given in the SOF header is not
     aligned with the restart marker intervals, if restart markers are used. In
@@ -41,96 +61,125 @@ import (
 
     In that case the end of row is the number of MCUs between 2 restart markers
     (restart interval) multiplied by the number of data units in the MCU, on a
-    component per component basis.
+    component per component basis:  nMcuRST * comp HSF
 
-        nMcuRST * component.hSF
-
-    McuDesc drives decompression by providing the huffman tables for each
-    data unit in the MCU, and for each data unit the location of each decoded
-    sample:
-
-    hDC, hAC        *hcnode     // huffman roots for DC and AC coefficients
-                                // use hDC for 1st sample, hAC for all others
-    dUnits          [][64]int   // up to vSF rows of hSF data units (64 int)
-    iDCTdata        []iDCTRow   // rows of reordered idata unit before iDCT
-    previousDC      int         // previous DC value for this component
-    nUnitsRow       uint        // n units per row = nSamplesLines/8
-    hSF, vSF        uint        // horizontal & vertical sampling factors
-    dUCol           uint        // increments with each dUI till it reaches hSF
-    dURow           uint        // increments with each row till it reaches vSF
-    dUAnchor        uint        // top-left corner of dUnits area, incremented
-                                // by hSF each time hSF*vSF data units are done
-    nRows           uint        // number of rows already processed
-    count           uint8       // current sample count [0-63] in each data unit
-    cId             uint8       // component id from _SOS
-    dcId, acId      uint8       // entropy table ids for DC & AC coefficients
-    quId, quSz      uint8       // quantization table id and size
+    scanComp drives decompression by providing the huffman tables for each
+    data unit in the MCU, the number of units per row and for each data unit
+    the location of each decoded sample in the image.
 
     However, DC and AC samples are preprocessed and in particular AC samples
     are runlength compressed before entropy compression: a single preprocessed
     AC sample can represent many 0 samples - EOB indicates that all following
     samples are 0 until the end of block (64), ZRL indicates that the sixteen
     following samples are 0 and any non-zero sample can be preceded by up to
-    15 zero samples.
+    15 zero samples. In case of progressive scans, a single AC sample may even
+    jump over many data units.
 */
 
 type scanCompRef struct {      // scan component reference
     cmId, dcId, acId uint8
 }
 
-func (jpg *Desc) newMcuDesc( s *scan, sComp *[]scanCompRef ) (*mcuDesc, error) {
+func getCoefNames( start, end uint8 ) (coefs string) {
 
-    mcu := new(mcuDesc)
-    mcu.sComps = make( []scanComp, len(*sComp) )
+    if start == 0 {
+        if end == 0 {
+            coefs = "DC only"
+        } else {
+            coefs = fmt.Sprintf( "DC and AC[%d..%d]", start+1, end )
+        }
+    } else {
+        coefs = fmt.Sprintf( "AC[%d..%d] only", start, end )
+    }
+    return
+}
 
-    fl := len( jpg.frames)
-    if fl == 0 { panic( "No frame for scan\v" ) }
+func getPointTransform( h, l uint8 ) (pt uint8) {
+    if h == 0 {
+        pt = 1 << l;
+    } else {
+        pt = 1 << l;
+    }
+    return
+}
+
+var componentNames = [...]string{ "Y", "Cb", "Cr" }
+func (jpg *Desc) setScan( s *scan, sComp *[]scanCompRef ) error {
 
     frm := jpg.getCurrentFrame()
-    for i, sc := range( *sComp ) {
-        qsz := uint8(jpg.qdefs[frm.components[i].QS].size)
-        if qsz == 0 {
-            return nil, fmt.Errorf( "Missing Quantization table %d for scan\n",
-                                    frm.components[i].QS )
-        }
-        cmp := frm.components[i]                        // ignore sc.cmId (order is fixed)
-        fmt.Printf( "Component %d HSF %d VSF %d\n", i, cmp.HSF, cmp.VSF )
-        mcu.sComps[i].hDC = jpg.hdefs[2*sc.dcId].root   // AC follows DC
-        if s.startSS == 0 && mcu.sComps[i].hDC == nil {
-            return nil, fmt.Errorf( "Missing Huffman table %d for DC scan (component %d)\n",
-                                    sc.dcId, i )
-        }
-        mcu.sComps[i].hAC = jpg.hdefs[2*sc.acId+1].root // (2 tables per dest)
-        if s.endSS > 0 && mcu.sComps[i].hAC == nil {
-            return nil, fmt.Errorf( "Missing Huffman table %d for AC scan (component %d)\n",
-                                    sc.acId, i )
-        }
-        nUnitsRow := (uint(frm.resolution.nSamplesLine) / uint(frm.resolution.mhSF)) *
-                      uint(cmp.HSF)
-        fmt.Printf( "nSamplesLine %d, mhSF %d, component %d HSF %d, nUnitsROw before adj %d\n",
-                    frm.resolution.nSamplesLine, frm.resolution.mhSF, i, cmp.HSF, nUnitsRow )
-        if nUnitsRow % 8 != 0 { nUnitsRow += 7 }        // round up to next unit
-        nUnitsRow /= 8
+    if frm == nil { panic( "No frame for scan\v" ) }
 
-        nUnitsRstInt := jpg.nMcuRST * uint(cmp.HSF)
-        fmt.Printf( "nUnitsRow after rounding %d, nUintsRstInt %d\n", nUnitsRow, nUnitsRstInt )
-        if nUnitsRstInt > nUnitsRow {
-            nUnitsRow = nUnitsRstInt
+    nComp := len( *sComp )
+    fmt.Printf( "Scan: %d component(s)\n", nComp )
+    fmt.Printf( "  Spectral Selection start: %d, end: %d coefficients: %s\n",
+                s.startSS, s.endSS, getCoefNames( s.startSS, s.endSS ) )
+    fmt.Printf( "  Sucessive Approximation Ah: %d, Al: %d point transform *%d\n",
+                s.sABPh, s.sABPl, getPointTransform( s.sABPh, s.sABPl ) )
+
+    s.sComps = make( []scanComp, nComp )
+    for i, sc := range( *sComp ) {
+        var cmp *component = nil;
+        for j, _ := range( frm.components ) {   // in fixed order Y, Cb, Cr
+            if sc.cmId == frm.components[j].Id {
+                cmp = &frm.components[j]
+                s.sComps[i].cType = uint8(j)
+                fmt.Printf( "  Component #%d id %d [%s]\n", i, sc.cmId, componentNames[j] )
+            }
         }
-        fmt.Printf( "Component %d nUnitsRow %d\n", i, nUnitsRow )
-        mcu.sComps[i].nUnitsRow = nUnitsRow
-        mcu.sComps[i].hSF = uint(cmp.HSF)
-        mcu.sComps[i].vSF = uint(cmp.VSF)
-        // preallocate vSF * nUnitsRow data units for this component
-        mcu.sComps[i].dUnits = make( []dataUnit, uint(cmp.VSF) * nUnitsRow )
-        // previousDC, dUCol, dURow, dUAnchor, nRows, count are set to 0
-        mcu.sComps[i].cId = sc.cmId
-        mcu.sComps[i].dcId = sc.dcId
-        mcu.sComps[i].acId = sc.acId
-        mcu.sComps[i].quId = frm.components[i].QS
-        mcu.sComps[i].quSz = qsz
+        if cmp == nil {
+            return fmt.Errorf( "Unknown component id %d for scan\n", sc.cmId );
+        }
+        s.sComps[i].iDCTdata = &cmp.iDCTdata
+        s.sComps[i].cId = cmp.Id
+
+        qsz := uint8(jpg.qdefs[cmp.QS].size)
+        if qsz == 0 {
+            return fmt.Errorf( "Missing Quantization table %d for scan\n",
+                               cmp.QS )
+        }
+        if qsz != frm.resolution.samplePrecision {
+            return fmt.Errorf( "Quantization size %d does not match frame sample size (%d)\n",
+                               qsz, frm.resolution.samplePrecision )
+        }
+
+        if s.startSS == 0 {
+            fmt.Printf( "    Huffman DC Id: %d\n", sc.dcId )
+            s.sComps[i].hDC = jpg.hdefs[2*sc.dcId].root   // AC follows DC
+            if s.sComps[i].hDC == nil {
+                return fmt.Errorf( "Missing Huffman table %d for DC scan (component %d)\n",
+                                   sc.dcId, i )
+            }
+        }
+        s.sComps[i].dcId = sc.dcId
+
+        if s.endSS > 0 {
+            fmt.Printf( "    Huffman AC Id: %d\n", sc.acId )
+            s.sComps[i].hAC = jpg.hdefs[2*sc.acId+1].root // (2 tables per dest)
+            if s.sComps[i].hAC == nil {
+                return fmt.Errorf( "Missing Huffman table %d for AC scan (component %d)\n",
+                                   sc.acId, i )
+            }
+        }
+        s.sComps[i].acId = sc.acId
+
+        // In case of multi-component scans, copy useful data from the component
+        // definition into the scanComp data structure
+        if nComp > 1 {
+            s.sComps[i].HSF, s.sComps[i].VSF, s.sComps[i].nUnitsRow =
+                    cmp.HSF,         cmp.VSF,         cmp.nUnitsRow
+        } else {
+            s.sComps[i].HSF, s.sComps[i].VSF = 1, 1
+            // calculate the number of data Units per line
+            roundingFactor := (uint16(frm.resolution.mhSF) * 8) / uint16(cmp.HSF)
+            s.sComps[i].nUnitsRow = uint((frm.resolution.nSamplesLine +
+                                                        roundingFactor - 1) /
+                                                                roundingFactor)
+        }
+        fmt.Printf( "    HSF %d, VSF %d, nUnitsRow %d\n",
+                    s.sComps[i].HSF, s.sComps[i].VSF, s.sComps[i].nUnitsRow )
+        // All other fields are intialized to 0
     }
-    return mcu, nil
+    return nil
 }
 
 func subsamplingFormat( sc *scan ) string {
@@ -165,17 +214,17 @@ func subsamplingFormat( sc *scan ) string {
     // Those formula could work for any nluma and nlumaLines above 4 and 3, but
     // the calculation would have to be done in float, before being turned back
     // to integers.
-    if len( sc.mcuD.sComps ) < 2 {
+    if len( sc.sComps ) < 2 {
         return ""   // no chroma
     }
-    lumaS := uint8( sc.mcuD.sComps[0].hSF )
-    lumaL := uint8( sc.mcuD.sComps[0].vSF )
-    chromaS := uint8( sc.mcuD.sComps[1].hSF )
-    chromaL := uint8( sc.mcuD.sComps[1].vSF )
+    lumaS := sc.sComps[0].HSF
+    lumaL := sc.sComps[0].HSF
+    chromaS := sc.sComps[1].HSF
+    chromaL := sc.sComps[1].VSF
 
-    if len( sc.mcuD.sComps ) == 3 &&
-        chromaS !=  uint8(sc.mcuD.sComps[2].hSF) &&
-        chromaL !=  uint8(sc.mcuD.sComps[2].vSF) {
+    if len( sc.sComps ) == 3 &&
+        chromaS !=  sc.sComps[2].HSF &&
+        chromaL !=  sc.sComps[2].VSF {
         return ""   // not representable
     }
     a := (chromaS * 4) / lumaS
@@ -183,11 +232,11 @@ func subsamplingFormat( sc *scan ) string {
     return fmt.Sprintf( "4:%d:%d", a, b )
 }
 
-func makeCompString( comp string, h, v uint ) string {
+func makeCompString( comp string, h, v uint8 ) string {
     var cs []byte = make( []byte, 64 )  // max 4 samples comp => 16 * 4
     j := int(0)
-    for row := uint(0); row < v; row ++ {
-        for col := uint(0); col < h; col++ {
+    for row := uint8(0); row < v; row ++ {
+        for col := uint8(0); col < h; col++ {
             n := copy( cs[j:], comp )
             j += n
             cs[j] = byte(row + '0')
@@ -200,16 +249,16 @@ func makeCompString( comp string, h, v uint ) string {
 
 func mcuFormat( sc *scan ) string {
 
-    nCmp := len( sc.mcuD.sComps )
+    nCmp := len( sc.sComps )
     if nCmp != 3 && nCmp != 1 { panic("Unsupported MCU format\n") }
 
-    luma := makeCompString( "Y", sc.mcuD.sComps[0].hSF, sc.mcuD.sComps[0].vSF )
+    luma := makeCompString( "Y", sc.sComps[0].HSF, sc.sComps[0].VSF )
     var mcuf string
     if nCmp == 3 {
         chromaB := makeCompString( "Cb",
-                                sc.mcuD.sComps[1].hSF, sc.mcuD.sComps[1].vSF )
+                                sc.sComps[1].HSF, sc.sComps[1].VSF )
         chromaR := makeCompString( "Cr",
-                                sc.mcuD.sComps[2].hSF, sc.mcuD.sComps[2].vSF )
+                                sc.sComps[2].HSF, sc.sComps[2].VSF )
         mcuf = fmt.Sprintf( "%s%s%s", luma, chromaB, chromaR )
     } else {
         mcuf = luma
@@ -353,17 +402,61 @@ func (jpg *Desc) startOfFrame( marker uint, sLen uint ) error {
 
         if hSF > maxHSF { maxHSF = hSF }
         if vSF > maxVSF { maxVSF = vSF }
-        frm.components = append( frm.components, Component{ cId, hSF, vSF, QS } )
+
+        frm.components = append( frm.components,
+                component{ Id: cId, HSF: hSF, VSF: vSF, QS: QS } )
         offset += frameComponentSpecSize
     }
 
     frm.resolution.mhSF = maxHSF
     frm.resolution.mvSF = maxVSF
 
-    frm.scans = append( frm.scans, scan{ } )    // ready for the first scan (yet unknown)
-    jpg.state = _SCAN1
+    // In a row the number of data units must be a multiple of the number of
+    // MCUs. Each MCU contains mhSF data units of the main component (usually
+    // the Y component) and each data unit contains exactly 8 samples. So the
+    // actual number of MCUs that must be encoded in a row is given by
+    // nMcuRow = ceiling(nSamplesLine / (mhSF * 8))
+    maxSamplesMCU := uint16(maxHSF) * 8
+    nMcusRow := (frm.resolution.nSamplesLine + maxSamplesMCU - 1) / maxSamplesMCU
+    fmt.Printf( "  Frame: %d samples per line, max horizontal SF %d, nMCUs/row %d\n",
+                frm.resolution.nSamplesLine, frm.resolution.mhSF, nMcusRow )
+
+    // In a column the number of data units must be a multiple of the number of
+    // MCUs. Each MCU contains mvSF data units of the main component (usually
+    // the Y component) and each data unit contains exactly 8 samples. So the
+    // actual number of MCUs that must be encoded in a column is given by
+    // nMcuCol = ceiling(nLines / (mvSF * 8))
+    maxSamplesMCU = uint16(maxVSF * 8) // changed maxSamplesMCU meaning
+    nMcusCol := (frm.resolution.nLines + maxSamplesMCU - 1) / maxSamplesMCU
+    fmt.Printf( "  Frame: %d lines, max vertical SF %d, nMCUs/col %d\n",
+                 frm.resolution.nLines, frm.resolution.mvSF, nMcusCol )
+    fmt.Printf( "  Frame: %d components\n", nComponents );
+    for i := uint(0); i < nComponents; i++ {
+        cmp := &frm.components[i]
+        fmt.Printf( "    component %d (%s) id %d:\n", i, componentNames[i], cmp.Id )
+        nUnitsRow := uint(nMcusRow) * uint(cmp.HSF)
+        cmp.nUnitsRow = nUnitsRow
+        fmt.Printf( "      horizontal sampling factor %d nUnitsRow: %d (%d samples)\n",
+                    cmp.HSF, nUnitsRow, nUnitsRow * 8 )
+
+        nUnitsCol := uint(nMcusCol) * uint(cmp.VSF)
+        if nUnitsCol == 0 {
+// FIXME: this is legal => preallocate 0 or some minimum number and allow
+//        dynamic extension during scan - it will just be slower...
+            panic("Unknown number of lines during scan\n")
+        }
+        fmt.Printf( "      vertical sampling factor %d nUnitsCol: %d (%d lines)\n",
+                    cmp.VSF, nUnitsCol, nUnitsCol * 8 )
+
+        cmp.iDCTdata = make( []iDCTRow, nUnitsCol )
+        for j := uint(0); j < nUnitsCol; j++ {
+            cmp.iDCTdata[j] = make( []dataUnit, nUnitsRow )
+        }
+    }
 
     jpg.addSeg( frm )
+    jpg.state = _SCAN1  // expecting DHT, DAC, DQT, DRI, COM, or SOS
+
     return nil
 }
 
@@ -371,16 +464,16 @@ func (jpg *Desc) startOfFrame( marker uint, sLen uint ) error {
 
 func (s *scan)serialize( w io.Writer ) (int, error) {
 
-    ls := uint16((len(s.mcuD.sComps) * scanComponentSpecSize) + fixedScanHeaderSize)
+    ls := uint16((len(s.sComps) * scanComponentSpecSize) + fixedScanHeaderSize)
     seg := make( []byte, ls + 2 )
     binary.BigEndian.PutUint16( seg, _SOS )
     binary.BigEndian.PutUint16( seg[2:], ls )
-    seg[4] = byte(len(s.mcuD.sComps))
+    seg[4] = byte(len(s.sComps))
 
     i := 5
-    for _, c := range s.mcuD.sComps {
-        seg[i] = c.cId
-        seg[i+1] = c.dcId << 4 + c.acId
+    for _, sc := range s.sComps {
+        seg[i] = sc.cId
+        seg[i+1] = sc.dcId << 4 + sc.acId
         i += 2
     }
     seg[i] = s.startSS
@@ -399,22 +492,20 @@ func (s *scan)serialize( w io.Writer ) (int, error) {
     return n, err
 }
 
-var compNames = [...]string{ " Y", "Cb", "Cr" }
-
 func (s *scan)formatMCUs( cw *cumulativeWriter, m FormatMode ) {
 
-    nComponents := len(s.mcuD.sComps)
+    nComponents := len(s.sComps)
     cw.format( "    %d Components:\n", nComponents )
-    for i, c := range s.mcuD.sComps {
+    for _, sc := range s.sComps {
         cw.format( "      %s Selector 0x%x, Sampling factors H:%d V:%d\n",
-                    compNames[i], c.cId, c.hSF, c.vSF )
+                   componentNames[sc.cType], sc.cId, sc.HSF, sc.VSF )
 
-        cw.format( "         Tables entropy DC:%d AC:%d," +
-                   " quantization:%d precision %d-bit\n",
-                   c.dcId, c.acId, c.quId, c.quSz )
+        cw.format( "         Tables entropy DC:%d AC:%d\n", sc.dcId, sc.acId )
+
         if m == Extra || m == Both {
-            cw.format( "         %d Data Units, %d iDCT matrices\n",
-                       len(c.dUnits), len(c.iDCTdata) )
+            cw.format( "         %d total Data Units, %d iDCT rows\n",
+                       len(*sc.iDCTdata) * len((*sc.iDCTdata)[0]),
+                       len(*sc.iDCTdata) )
         }
     }
     if m == Extra || m == Both {
@@ -459,18 +550,18 @@ func (s *scan)format( w io.Writer ) (n int, err error) {
     return
 }
 
-func (jpg *Desc) processScanHeader( sLen uint ) (scan *scan, err error) {
+func (jpg *Desc) processScanHeader( sLen uint, sc *scan ) (err error) {
 
     offset := jpg.offset + markerLengthSize
     nComponents := uint(jpg.data[offset])
 
     offset += 1
     if sLen != fixedScanHeaderSize + nComponents * scanComponentSpecSize {
-        return nil, fmt.Errorf(
+        return fmt.Errorf(
             "processScanHeader: Wrong SOS header (len %d for %d components)\n",
             sLen, nComponents )
     }
-    fmt.Printf( "n Components %d\n", nComponents )
+//    fmt.Printf( "Scan %d Components\n", nComponents )
     sCs := make( []scanCompRef, nComponents )
     for i := uint(0); i < nComponents; i++ {
         sCs[i].cmId = jpg.data[offset]
@@ -478,23 +569,56 @@ func (jpg *Desc) processScanHeader( sLen uint ) (scan *scan, err error) {
         sCs[i].dcId = eIDs >> 4
         sCs[i].acId = eIDs & 0x0f
         offset += scanComponentSpecSize
-        fmt.Printf( "Huffman DC Id: %d, AC Id %d\n", sCs[i].dcId, sCs[i].acId )
     }
 
-    scan = jpg.getCurrentScan()
-    if scan == nil { panic("processScanHeader: scan not allocated\n") }
-
-    scan.rstInterval = jpg.nMcuRST
-    scan.startSS = jpg.data[offset]
-    scan.endSS = jpg.data[offset+1]
+    sc.rstInterval = jpg.nMcuRST
+    sc.startSS = jpg.data[offset]
+    sc.endSS = jpg.data[offset+1]
     sABP := jpg.data[offset+2]
-    scan.sABPh = sABP >> 4
-    scan.sABPl = sABP & 0x0f
+    sc.sABPh = sABP >> 4
+    sc.sABPl = sABP & 0x0f
 
-    fmt.Printf( "Spectral Selection start: %d, end: %d\n", scan.startSS, scan.endSS )
-    fmt.Printf( "Sucessive Approximation Ah: %d, Al: %d\n", scan.sABPh, scan.sABPl )
+    // FIXME: check if frame nLines is bigger than a threshold (considered as invalid)
+    //        and set it to 0 before calling setScan
 
-    scan.mcuD, err = jpg.newMcuDesc( scan, &sCs );
+    err = jpg.setScan( sc, &sCs );
+    return
+}
+
+func (jpg *Desc)getEcsFct( frm *frame,
+                           s *scan ) (f func ( uint, *scan ) (uint, error), 
+                                                                err error) {
+
+    mode := frm.encodingMode()
+
+    switch mode  {
+    default:
+        err = fmt.Errorf( "processScan: unsupported scanning mode %s in\n",
+                          encodingModeString(mode) )
+    case BaselineSequential:
+        f = jpg.processSequentialEcs
+    case ExtendedProgressive:
+        if s.startSS == 0 {     // include DC coefficient
+            if s.endSS != 0 {
+                panic( "Progressive frame mixing DC and AC coefficient in same scan" )
+            }
+            if s.sABPh == 0 {   // treat initial DC scan as sequential
+                f = jpg.processSequentialEcs
+            } else {            // special case for refining DC coefficients
+                //jpg.Mcu = true  // for debugging
+                f = jpg.processRefiningDcEcs
+            }
+        } else {                // only AC coefficients
+            if len( s.sComps ) != 1 {
+                panic( "Progressive frame AC only scan with multiple components" )
+            }
+            if s.sABPh == 0 {   // initial AC scan
+                f = jpg.processInitialAcEcs
+            } else {
+                f = jpg.processRefiningAcEcs
+            }
+        }
+    }
     return
 }
 
@@ -508,8 +632,15 @@ func (jpg *Desc) processScan( marker, sLen uint ) error {
         return fmt.Errorf( "processScan: Wrong SOS header (len %d)\n", sLen )
     }
 
-    sc, err := jpg.processScanHeader( sLen );
-    if err != nil {
+    frm := jpg.getCurrentFrame( )
+    if frm == nil {
+        panic( "Scan without frame" )
+    }
+
+    frm.scans = append( frm.scans, scan{ } )    // add new unknown scan
+    sc := jpg.getCurrentScan()
+
+    if err := jpg.processScanHeader( sLen, sc ); err != nil {
         return err
     }
     if jpg.state == _SCAN1 {
@@ -521,6 +652,11 @@ func (jpg *Desc) processScan( marker, sLen uint ) error {
     jpg.offset += sLen + 2
     firstECS := jpg.offset
 
+    processECS, err := jpg.getEcsFct( frm, sc )
+    if err != nil {
+        return err
+    }
+
     rstCount := uint(0)
     var lastRSTIndex, nIx uint
     var lastRST uint = 7
@@ -528,7 +664,7 @@ func (jpg *Desc) processScan( marker, sLen uint ) error {
 
     var nMCUs uint
     for ; ; {   // processECS return upon error, reached EOF or 0xFF followed by non-zero
-        if nMCUs, err = jpg.processECS( nMCUs ); err != nil {
+        if nMCUs, err = processECS( nMCUs, sc ); err != nil {
             return jpgForwardError( "processScan", err )
         }
         nIx = jpg.offset
@@ -536,12 +672,37 @@ func (jpg *Desc) processScan( marker, sLen uint ) error {
             break
         }       // else one of RST0-7 embedded in scan data, keep going
 
+        if jpg.Warn {
+            if jpg.nMcuRST == 0 {
+                fmt.Printf( "  WARNING: Restart Marker found without Restart Interval definition\n" )
+            } else {
+                if nMCUs % jpg.nMcuRST != 0 {
+                fmt.Printf( "  WARNING: Restart Marker found before the Restart Interval\n" )
+                }
+            }
+        }
+
         RST := uint( jpg.data[nIx+1] - 0xd0 )
         if (lastRST + 1) % 8 != RST { // don't try to fix it, as it may indicate
                                       // a corrupted file with missing samples.
             if jpg.Warn {
                 fmt.Printf( "  WARNING: invalid RST sequence (%d, expected %d)\n",
                             RST, (lastRST + 1) % 8 )
+            }
+            // Altough this is highly unlikely, it indicates a gap in encoded
+            // samples. Based on the new RST value, calculate how many MCUs
+            // have been lost. This is not a fool proof solution since the RST
+            // numbers wrap up after 8 and there is no way to know if wrapping
+            // occured multiple times. Assuming it did not occur, or only once:
+            if jpg.nMcuRST != 0 {                       // fix nMCUs
+                nMCUs = (nMCUs / jpg.nMcuRST) * nMCUs   // back to previous
+                var delta uint
+                if RST > lastRST {
+                    delta = RST - lastRST
+                } else {
+                    delta = 8 - lastRST + RST
+                }
+                nMCUs += jpg.nMcuRST * delta
             }
         }
         lastRSTIndex = nIx
@@ -564,15 +725,10 @@ func (jpg *Desc) processScan( marker, sLen uint ) error {
     sc.ECSs = jpg.data[firstECS:nIx]
     sc.nMcus = nMCUs
     sc.rstCount = rstCount
-    if err = jpg.dequantize( sc ); err != nil {
-        return err
-    }
-
-    frm := jpg.getCurrentFrame( )
-    frm.scans = append( frm.scans, scan{ } )    // ready for next scan
-    jpg.state = _SCANn
 
     jpg.addSeg( sc )
+    jpg.state = _SCANn  // accept folloring scans (if progressive mode)
+
     return nil
 }
 
@@ -613,6 +769,15 @@ func (jpg *Desc)defineRestartInterval( marker, sLen uint ) error {
                         frm.resolution.nSamplesLine )
         }
     }
+
+    for _, cmp := range frm.components {
+        if cmp.nUnitsRow / uint(cmp.HSF) < jpg.nMcuRST {
+            fmt.Printf( "  Warning: restart interval %d is larger than the number of MCUs per row\n",
+                        jpg.nMcuRST, cmp.nUnitsRow / uint(cmp.HSF) )
+            break;
+        }
+    }
+
     jpg.addSeg( rs )
     return nil
 }
@@ -840,11 +1005,16 @@ func buildTree( values [16][]uint8 ) (root *hcnode) {
                     level++
                 } else {
 //                    fmt.Printf( "level %d Last node %p .left & right are not nil, back up\n", level, last  )
+                    if level == 0 {
+                        panic( fmt.Sprintf( "backing up above root: code length %d, level %d last %p, root %p\n",
+                                            cl, level, last, root ) )
+                    }
                     last = last.parent
                     level--
                 }
             }
 
+//            fmt.Printf( "level %d, last node %p\n", level, last )
             // last is a new leaf
             if last.left != nil || last.right != nil {
                 panic( fmt.Sprintf( "level %d Last node %p is not a leaf node", level, last ) )
@@ -1005,7 +1175,9 @@ func (jpg *Desc)defineHuffmanTable( marker, sLen uint ) ( err error ) {
     for ; ; {
         tc := uint(jpg.data[offset]) >> 4
         th := uint(jpg.data[offset]) & 0x0f
+        offset++
 
+//        fmt.Printf("defineHuffmanTable: class %d dest %d\n", tc, th )
         if tc > 1 || th > 3 {
             return fmt.Errorf( "defineHuffmanTable: Wrong table class/destination (%d/%d)\n", tc, th )
         }
@@ -1015,9 +1187,11 @@ func (jpg *Desc)defineHuffmanTable( marker, sLen uint ) ( err error ) {
         hts.htcds[ht].hd = byte(th)
 
         td := 2*th+tc // use 8 tables, (1 for DC + 1 for AC per destination) * 4
-        offset++
         voffset := offset+16
 
+        for hcli := uint(0); hcli < 16; hcli++ {
+            jpg.hdefs[td].values[hcli] = nil    // ready to replace table (append)
+        }
         for hcli := uint(0); hcli < 16; hcli++ {
             li := uint(jpg.data[offset+hcli])
             jpg.hdefs[td].values[hcli] = append(
@@ -1030,6 +1204,7 @@ func (jpg *Desc)defineHuffmanTable( marker, sLen uint ) ( err error ) {
         }
         jpg.hdefs[td].root = buildTree( jpg.hdefs[td].values )
         fmt.Printf("Huffman table class %d dest %d defined\n", tc, th )
+
         ht++
         offset = voffset;
         if offset >= end {
@@ -1146,18 +1321,17 @@ func (jpg *Desc)fixLines( ) {
         fmt.Printf("Non Sequential Huffman coded frame(s): lines are left untouched\n")
         return
     }
-    n := len( frm.scans ) - 1   // always one scan ready for a possible new scan
-    if n == 0 { panic("Internal error (no scan for image)\n") }
-
-    nLines := uint(0)   // calculate the actual number of lines from scan results
-    for i:= 0; i < n; i++ {
-        scan := &frm.scans[i]
-        if nLines < scan.mcuD.sComps[0].nRows {
-            nLines = scan.mcuD.sComps[0].nRows
+    // use actual number of unit rows from Y component
+    nLines := len(frm.components[0].iDCTdata)   // nUnits Y Col
+    yVSF := int(frm.components[0].VSF)          // nUnits per MCU col
+    for _, cmp := range frm.components {
+        if (len(frm.components[0].iDCTdata) * yVSF) / int(cmp.VSF) != nLines {
+            panic( "Inconsistent frame component resolution\n" )
         }
     }
-    scanLines := uint16(nLines * 8) // 8 pixel lines per data unit row
-    if scanLines != frm.resolution.nLines {
+    scanLines := uint16(nLines * 8)             // 8 pixel lines per unit
+    if scanLines < frm.resolution.nLines ||
+        scanLines > (frm.resolution.nLines - (uint16(frm.resolution.mvSF) * 8)) {
         fmt.Printf( "  FIXING: replacing number of lines in Start Of Frame " +
                     "with actual scan results (from %d to %d)\n",
                     frm.resolution.nLines, scanLines )
