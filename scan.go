@@ -624,14 +624,19 @@ func (jpg *Desc) processSequentialEcs( nMCUs uint, scan *scan ) (uint, error) {
     /*  after each RST, reset previousDC, dUAnchor, dUCol, dURow & count
         for each scan component (Y[,Cb,Cr]) */
     for i := len(scan.sComps)-1; i >= 0; i-- {
-fmt.Printf("  sComp %d: HSF=%d, nUnitsRow=%d\n", i, scan.sComps[i].HSF, scan.sComps[i].nUnitsRow)
+fmt.Printf("  sComp %d: HSF=%d, VSF=%d mMCUs=%d nUnitsRow=%d\n",
+            i, scan.sComps[i].HSF, scan.sComps[i].VSF, nMCUs, scan.sComps[i].nUnitsRow)
         scan.sComps[i].previousDC = 0   // restart DC delta
         scan.sComps[i].dUCol = 0
         scan.sComps[i].dURow = 0
+        // the following is only necessary in case of missing data
         scan.sComps[i].dUAnchor = (nMCUs * uint(scan.sComps[i].HSF)) %
                                             scan.sComps[i].nUnitsRow
-        scan.sComps[i].nRows = (nMCUs * uint(scan.sComps[i].HSF)) /
-                                            scan.sComps[i].nUnitsRow
+        scan.sComps[i].nRows = (nMCUs * uint(scan.sComps[i].HSF)) *
+                                            uint(scan.sComps[i].VSF) /
+                                                scan.sComps[i].nUnitsRow
+//fmt.Printf("   after updating dUAnchor=%d, nRows=%d\n",
+//            scan.sComps[i].dUAnchor, scan.sComps[i].nRows)
 //fmt.Printf("processSequentialEcs: comp index %d, rows=%d dUAnchor=%d\n",
 //            i, scan.sComps[i].nRows, scan.sComps[i].dUAnchor)
         scan.sComps[i].count = 0       // always start at DC
@@ -1004,8 +1009,9 @@ func (jpg *Desc) processRefiningDcEcs( nMCUs uint, scan *scan ) (uint, error) {
         scan.sComps[i].dURow = 0
         scan.sComps[i].dUAnchor = (nMCUs * uint(scan.sComps[i].HSF)) %
                                     scan.sComps[i].nUnitsRow
-        scan.sComps[i].nRows = (nMCUs * uint(scan.sComps[i].HSF)) /
-                                    scan.sComps[i].nUnitsRow
+        scan.sComps[i].nRows = (nMCUs * uint(scan.sComps[i].HSF)) *
+                                            uint(scan.sComps[i].VSF) /
+                                                scan.sComps[i].nUnitsRow
 //fmt.Printf("processRefiningDcEcs: comp index %d, rows=%d dUAnchor=%d\n",
 //            i, scan.sComps[i].nRows, scan.sComps[i].dUAnchor)
         scan.sComps[i].count = 0       // only DC coefficient

@@ -657,6 +657,7 @@ func (jpg *Desc) processScan( marker, sLen uint ) error {
 
     rstCount := uint(0)
     var lastRSTIndex, nIx uint
+    var lastMcuCount uint
     var lastRST uint = 7
     tLen := uint(len( jpg.data ))   // start hunting for 0xFFxx with xx != 0x00
 
@@ -692,17 +693,17 @@ func (jpg *Desc) processScan( marker, sLen uint ) error {
             // have been lost. This is not a fool proof solution since the RST
             // numbers wrap up after 8 and there is no way to know if wrapping
             // occured multiple times. Assuming it did not occur, or only once:
-            if jpg.nMcuRST != 0 {                       // fix nMCUs
-                nMCUs = (nMCUs / jpg.nMcuRST) * nMCUs   // back to previous
-                var delta uint
+            if jpg.nMcuRST != 0 {                           // fix nMCUs
+                var lostIntervals uint
                 if RST > lastRST {
-                    delta = RST - lastRST
+                    lostIntervals = RST - lastRST
                 } else {
-                    delta = 8 - lastRST + RST
+                    lostIntervals = 8 - lastRST + RST
                 }
-                nMCUs += jpg.nMcuRST * delta
+                nMCUs = lastMcuCount + jpg.nMcuRST * lostIntervals
             }
         }
+        lastMcuCount = nMCUs
         lastRSTIndex = nIx
         lastRST = RST
         rstCount++
@@ -760,22 +761,20 @@ func (jpg *Desc)defineRestartInterval( marker, sLen uint ) error {
     jpg.nMcuRST = uint(restartInterval)
 
     frm := jpg.getCurrentFrame( )
-    if frm != nil && frm.resolution.nSamplesLine % restartInterval != 0 {
-        if jpg.Warn {
+    if frm != nil && jpg.Warn {
+        if frm.resolution.nSamplesLine % restartInterval != 0 {
             fmt.Printf( "  Warning: number of samples per line (%d) is not a" +
                         " multiple of the restart interval\n",
                         frm.resolution.nSamplesLine )
         }
-    }
-
-    for _, cmp := range frm.components {
-        if cmp.nUnitsRow / uint(cmp.HSF) < jpg.nMcuRST {
-            fmt.Printf( "  Warning: restart interval %d is larger than the number of MCUs per row\n",
-                        jpg.nMcuRST, cmp.nUnitsRow / uint(cmp.HSF) )
-            break;
+        for _, cmp := range frm.components {
+            if cmp.nUnitsRow / uint(cmp.HSF) < jpg.nMcuRST {
+                fmt.Printf( "  Warning: restart interval %d is larger than the number of MCUs per row\n",
+                            jpg.nMcuRST, cmp.nUnitsRow / uint(cmp.HSF) )
+                break;
+            }
         }
     }
-
     jpg.addSeg( rs )
     return nil
 }
