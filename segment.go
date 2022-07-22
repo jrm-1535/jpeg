@@ -211,14 +211,14 @@ func subsamplingFormat( sc *scan ) string {
     // factor is not 2, the coefficient 2/nLumaLines must be applied:
     // Therefore: a = (chromaS * 4) / lumaS
     //            b = a * (((chromaL * 2) / lumaL) - 1)
-    // Those formula could work for any nluma and nlumaLines above 4 and 3, but
+    // Those formulae could work for any nluma and nlumaLines above 4 and 3, but
     // the calculation would have to be done in float, before being turned back
     // to integers.
     if len( sc.sComps ) < 2 {
         return ""   // no chroma
     }
     lumaS := sc.sComps[0].HSF
-    lumaL := sc.sComps[0].HSF
+    lumaL := sc.sComps[0].VSF
     chromaS := sc.sComps[1].HSF
     chromaL := sc.sComps[1].VSF
 
@@ -342,10 +342,10 @@ func (f *frame)format( w io.Writer ) (n int, err error) {
                " sample precision: %d-bit, components: %d\n",
                f.actualLines(), nSamples,
                f.resolution.samplePrecision, len( f.components ) )
-    if ( nSamples % 8) != 0 {
-        cw.format( "    Warning: Samples/Line (%d) is not a multiple of 8\n",
-                   nSamples )
-    }
+//    if ( nSamples % 8) != 0 {
+//        cw.format( "    Warning: Samples/Line (%d) is not a multiple of 8\n",
+//                   nSamples )
+//    }
     nMCUsLine := uint16(f.image.nMcuRST)
     if nMCUsLine != 00 && (nSamples % nMCUsLine) != 0 {
         cw.format( "    Warning: Samples/Line (%d) is not a " +
@@ -503,7 +503,7 @@ func (s *scan)formatMCUs( cw *cumulativeWriter, m FormatMode ) {
         cw.format( "         Tables entropy DC:%d AC:%d\n", sc.dcId, sc.acId )
 
         if m == Extra || m == Both {
-            cw.format( "         %d total Data Units, %d iDCT rows\n",
+            cw.format( "         allocated %d Data Units, %d iDCT rows\n",
                        len(*sc.iDCTdata) * len((*sc.iDCTdata)[0]),
                        len(*sc.iDCTdata) )
         }
@@ -514,17 +514,15 @@ func (s *scan)formatMCUs( cw *cumulativeWriter, m FormatMode ) {
         cw.format( "    Successive approximation bit position, high:%d low:%d\n",
                     s.sABPh, s.sABPl )
 
-        subsampling := subsamplingFormat( s )
-        mcuFormat := mcuFormat( s )
-
-        var comString string
-        if nComponents == 3 {
-            comString = "Interleaved"
+        if nComponents > 1 {
+            subsampling := subsamplingFormat( s )
+            mcuFormat := mcuFormat( s )
+            comString := "Interleaved"
+            cw.format( "    Subsampling %s - %s MCU format %s\n",
+                       subsampling, comString, mcuFormat )
         } else {
-            comString = "Grayscale Y"
+            cw.format( "    Single component - non-interleaved MCU\n" )
         }
-        cw.format( "    Subsampling %s - %s MCU format %s\n",
-                   subsampling, comString, mcuFormat )
     }
     cw.format( "    Total %d MCUs in scan\n", s.nMcus )
     if s.rstInterval > 0 {

@@ -23,6 +23,13 @@ func (j *Desc)FormatImageInfo( w io.Writer ) (n int, err error) {
     return
 }
 
+func (j *Desc)getFrameSegment( fi uint ) *frame {
+    if fi < 0 || fi >= uint(len(j.frames)) {
+        return nil
+    }
+    return &j.frames[fi]
+}
+
 type Component struct {
     Id, HSF, VSF, QS uint8
 }
@@ -38,27 +45,44 @@ type FrameInfo struct {
 // GetFrameInfo returns encoding information about a specific frame, indentified
 // by the argument frame. An error is returned if the requested frame does not
 // exist. For non-hierarchical modes, only one frame (0) is used.
-func (j *Desc)GetFrameInfo( frame int ) (*FrameInfo, error) {
-    if frame >= len(j.frames) || frame < 0 {
-        return nil, fmt.Errorf( "GetFrameInfo: frame %d is absent\n", frame )
+func (j *Desc)GetFrameInfo( fi uint ) (*FrameInfo, error) {
+    frm := j.getFrameSegment( fi )
+    if frm == nil {
+        return nil, fmt.Errorf( "GetFrameInfo: frame %d is absent\n", fi )
     }
-    frm := j.frames[frame]
 
-    fi := new (FrameInfo)
-    fi.Mode = frm.encodingMode( )
-    fi.Entropy = frm.entropyCoding( )
-    fi.SampleSize = frm.samplePrecision( )
-    fi.Width = frm.nSamplesLine( )
-    fi.Height = uint(frm.actualLines( ))
+    finfo := new (FrameInfo)
+    finfo.Mode = frm.encodingMode( )
+    finfo.Entropy = frm.entropyCoding( )
+    finfo.SampleSize = frm.samplePrecision( )
+    finfo.Width = frm.nSamplesLine( )
+    finfo.Height = uint(frm.actualLines( ))
 
-    fi.Components = make( []Component, len(frm.components) )
+    finfo.Components = make( []Component, len(frm.components) )
     for i, cmp := range frm.components {
-        fi.Components[i].Id = cmp.Id
-        fi.Components[i].Id = cmp.HSF
-        fi.Components[i].Id = cmp.VSF
-        fi.Components[i].Id = cmp.QS
+        finfo.Components[i].Id = cmp.Id
+        finfo.Components[i].Id = cmp.HSF
+        finfo.Components[i].Id = cmp.VSF
+        finfo.Components[i].Id = cmp.QS
     }
-    return fi, nil
+    return finfo, nil
+}
+
+// FormatFrameInfo writes a textual description of a specific frame encoding
+// information. An error is returned if the requested frame does not exist.
+// For non-hierarchical modes, only one frame (0) is used.
+func (j *Desc)FormatFrameInfo( w io.Writer, fi uint ) (n int, err error) {
+    frm := j.getFrameSegment( fi )
+    if frm == nil {
+        return 0, fmt.Errorf( "FormatFrameInfo: frame %d is absent\n", fi )
+    }
+    if n, err = fmt.Fprintf( w, "Frame #%d:\n", frm.id ); err != nil {
+        return
+    }
+    var np int
+    np, err = frm.format( w )
+    n += np
+    return
 }
 
 func (j *Desc)getFrameSegmentIndex( n uint ) int {
@@ -72,14 +96,6 @@ func (j *Desc)getFrameSegmentIndex( n uint ) int {
         }
     }
     return -1
-}
-
-func (j *Desc)getFrameSegment( n uint ) *frame {
-    index := j.getFrameSegmentIndex( n )
-    if index == -1 {
-        return nil
-    }
-    return j.segments[index].(*frame)
 }
 
 func (j *Desc)getStartOfScanSegmentIndex( fi int ) int {
@@ -100,24 +116,6 @@ func (j *Desc)getDefineHuffmanSegmentIndex( fi int ) int {
     return -1
 }
 
-// FormatFrameInfo writes a textual description of a specific frame encoding
-// information. An error is returned if the requested frame does not exist.
-// For non-hierarchical modes, only one frame (0) is used.
-func (j *Desc)FormatFrameInfo( w io.Writer, fr uint ) (n int, err error) {
-    segIndex := j.getFrameSegmentIndex( fr )
-    if segIndex < 0 {
-        return 0, fmt.Errorf( "FormatFrameInfo: frame %d is absent\n", fr )
-    }
-    frm := j.segments[segIndex].(*frame)
-    if n, err = fmt.Fprintf( w, "Frame #%d:\n", frm.id ); err != nil {
-        return
-    }
-    var np int
-    np, err = frm.format( w )
-    n += np
-    return
-}
-
 func (j *Desc)getQuantizationSegmentsForFrame( n uint ) ([]*qtSeg, error) {
     var first, beyond int
     if n > 0 {
@@ -133,7 +131,7 @@ func (j *Desc)getQuantizationSegmentsForFrame( n uint ) ([]*qtSeg, error) {
     if beyond == -1 {
         return nil, fmt.Errorf( "getQuantizationSegmentsForFrame: no SOS for frame %d\n", n )
     }
-//fmt.Printf("frame %d first %d beyond %d\n", n, first, beyond )
+
     var qts []*qtSeg
     for _, s := range j.segments[first:beyond] {
         if qt, ok := s.(*qtSeg); ok {
@@ -195,8 +193,6 @@ func (j *Desc)formatQuantizationSegment( w io.Writer, frame uint, d int,
     }
     return j.formatQuantization( w, frame, d, m, false )
 }
-
-
 
 func (j *Desc)getHuffmanSegmentsForFrame( n uint ) ([]*htSeg, error) {
     var first, beyond int
@@ -296,43 +292,18 @@ func (j *Desc)formatEntropySegment( w io.Writer, frame uint,
     }
 }
 
-func (j *Desc)getScanSegmentsForFrame( n uint ) ([]*scan, error) {
-    var first, beyond int
-    first = j.getFrameSegmentIndex( n )
-    if first < 0 {
-        return nil, fmt.Errorf( "getScanSegmentsForFrame: frame %d is absent\n", n )
-    }
-    beyond = j.getFrameSegmentIndex( n+1 )
-    if beyond < 0 {
-        beyond = len(j.segments)
-    }
-    first = j.getStartOfScanSegmentIndex( first )
-    if first == -1 {
-        return nil, fmt.Errorf( "getScanSegmentsForFrame: no SOS for frame %d\n", n )
-    }
-    
-//fmt.Printf("frame %d first %d beyond %d\n", n, first, beyond )
-    var scs []*scan
-    for _, s := range j.segments[first:beyond] {
-        if s, ok := s.(*scan); ok {
-            scs = append( scs, s )
-        }
-    }
-    return scs, nil
-}
-
 func (j *Desc)formatScanSegment( w io.Writer, frame uint, index int,
                                  mode FormatMode ) (n int, err error) {
-    frs := j.getFrameSegment( frame )
-    if frs == nil {
+    frm := j.getFrameSegment( frame )
+    if frm == nil {
         return 0, fmt.Errorf( "formatEntropySegment: frame %d is absent\n",
                               frame )
     }
-    scs, err := j.getScanSegmentsForFrame( frame )
-    if err != nil {
-        return 0, fmt.Errorf( "formatScanSegment: %v\n", err )
+    scs := frm.scans
+    if index >= len(frm.scans) {
+        return 0, fmt.Errorf( "formatEntropySegment: scan %s does not exist for frame %d\n",
+                              index, frame )
     }
-
     cw := newCumulativeWriter( w )
     cw.format( "Frame #%d\n", frame )
 
@@ -341,12 +312,8 @@ func (j *Desc)formatScanSegment( w io.Writer, frame uint, index int,
             sc.formatAt( cw, i, mode )
         }
     } else {
-        for i, sc := range scs {
-            if i == index {
-                sc.formatAt( cw, i, mode )
-                break
-            }
-        }
+        sc := frm.scans[index]
+        sc.formatAt( cw, index, mode )
     }
     n, err = cw.result()
     return
@@ -427,21 +394,40 @@ func (j *Desc)FormatMetadata( w io.Writer, appId int, sIds []int ) (n int, err e
 }
 
 func (j *Desc)FormatFrameComponent( w io.Writer,
-                                    frame, comp uint ) (n int, err error) {
+                                    frame uint, comp int ) (n int, err error) {
     frm := j.getFrameSegment( frame )
     if frm == nil {
         return 0, fmt.Errorf( "FormatFrameComponent: frame %d is absent\n",
                               frame )
     }
 
-    if comp >= uint(len(frm.components)) {
+    if comp >= len(frm.components) || comp < -1 {
         return 0, fmt.Errorf( "FormatFrameComponent: component %d not available\n",
                               comp )
     }
-    cmp := &frm.components[comp]
+
     cw := newCumulativeWriter( w )
-    cw.format( "Frame %d, Component %d: %d rows of %d data units\n",
-               frame, comp, len(cmp.iDCTdata), len(cmp.iDCTdata[0]) );
+    cw.format( "Frame %d, %d components:\n", frame, len(frm.components) )
+
+    formatComponent := func( c int ) {
+        cmp := &frm.components[c]
+        cw.format( "  Component %d: allocated %d rows of %d samples\n",
+                    c, len(cmp.iDCTdata) * 8, len(cmp.iDCTdata[0]) * 8 );
+        vAlign := uint16(8 * frm.resolution.mvSF / cmp.VSF)
+        auRows := ((frm.resolution.nLines + vAlign - 1) / vAlign) << 3
+        hAlign := uint16(8 * frm.resolution.mhSF / cmp.HSF)
+        auSamplesRow := ((frm.resolution.nSamplesLine + hAlign - 1) / hAlign) << 3
+        cw.format( "           actually used %d rows of %d samples\n",
+                    auRows, auSamplesRow)
+    }
+
+    if comp == -1 {
+        for i, _ := range frm.components {
+            formatComponent( i )
+        }
+    } else {
+        formatComponent( comp )
+    }
     n, err = cw.result()
 /*
     var du = dataUnit{
