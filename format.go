@@ -5,6 +5,19 @@ import (
     "io"
 )
 
+// FormatSegments prints out all segments that constitute the image.
+func (jpg *Desc) FormatSegments( w io.Writer ) (n int, err error) {
+    var np int
+    for _, s := range jpg.segments {
+        np, err = s.format( w )
+        if err != nil {
+            return
+        }
+        n += np
+    }
+    return
+}
+
 // GetImageInfo returns the framing information, whether it is a single frame
 // (sequential or progressive) or multiple frames (hierarchical)
 func (j *Desc)GetImageInfo( ) Framing {
