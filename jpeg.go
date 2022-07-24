@@ -172,7 +172,7 @@ type scanComp struct {
     dURow           uint        // increments with each row till it reaches VSF
     dUAnchor        uint        // top-left corner of dUnits area, incremented
                                 // by HSF each time HSF*VSF data units are done
-    nRows           uint        // number of rows already processed
+    nRows           uint        // number of data Units rows already processed
 
     // in case of non-interleaved scans (single component per scan), the
     // following values differ from their cmp counterparts (nUnitsRow, HSF &
@@ -616,7 +616,8 @@ func (jpg *Desc)printMarker( marker, sLen, offset uint ) {
     }
 }
 
-type Control struct {       // control parsing verbosity
+type Control struct {       // control parsing
+    Verbose         bool    // print extra information: turn on in case of error
     Warn            bool    // Warn about inconsistencies as they are seen
     Recurse         bool    // Recurse and parse embedded JPEG pictures
     TidyUp          bool    // Fix and clean up JPEG segments
@@ -692,7 +693,9 @@ makerLoop:
             }
             jpg.state = _FINAL
             jpg.offset = i + 2  // points after the last byte
-            if jpg.TidyUp { jpg.fixLines( ) }
+            if err := jpg.checkLines( ); nil != err {
+                return nil, err
+            }
             break makerLoop // exit even if there is junk at the end of the file
 
         default:        // all other cases have data following marker & length

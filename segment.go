@@ -110,12 +110,13 @@ func (jpg *Desc) setScan( s *scan, sComp *[]scanCompRef ) error {
     if frm == nil { panic( "No frame for scan\v" ) }
 
     nComp := len( *sComp )
-    fmt.Printf( "Scan: %d component(s)\n", nComp )
-    fmt.Printf( "  Spectral Selection start: %d, end: %d coefficients: %s\n",
-                s.startSS, s.endSS, getCoefNames( s.startSS, s.endSS ) )
-    fmt.Printf( "  Sucessive Approximation Ah: %d, Al: %d point transform *%d\n",
-                s.sABPh, s.sABPl, getPointTransform( s.sABPh, s.sABPl ) )
-
+    if jpg.Verbose {
+        fmt.Printf( "Scan: %d component(s)\n", nComp )
+        fmt.Printf( "  Spectral Selection start: %d, end: %d coefficients: %s\n",
+                    s.startSS, s.endSS, getCoefNames( s.startSS, s.endSS ) )
+        fmt.Printf( "  Sucessive Approximation Ah: %d, Al: %d point transform *%d\n",
+                    s.sABPh, s.sABPl, getPointTransform( s.sABPh, s.sABPl ) )
+    }
     s.sComps = make( []scanComp, nComp )
     for i, sc := range( *sComp ) {
         var cmp *component = nil;
@@ -123,7 +124,10 @@ func (jpg *Desc) setScan( s *scan, sComp *[]scanCompRef ) error {
             if sc.cmId == frm.components[j].Id {
                 cmp = &frm.components[j]
                 s.sComps[i].cType = uint8(j)
-                fmt.Printf( "  Component #%d id %d [%s]\n", i, sc.cmId, componentNames[j] )
+                if jpg.Verbose {
+                    fmt.Printf( "  Component #%d id %d [%s]\n",
+                                    i, sc.cmId, componentNames[j] )
+                }
             }
         }
         if cmp == nil {
@@ -143,7 +147,9 @@ func (jpg *Desc) setScan( s *scan, sComp *[]scanCompRef ) error {
         }
 
         if s.startSS == 0 {
-            fmt.Printf( "    Huffman DC Id: %d\n", sc.dcId )
+            if jpg.Verbose {
+                fmt.Printf( "    Huffman DC Id: %d\n", sc.dcId )
+            }
             s.sComps[i].hDC = jpg.hdefs[2*sc.dcId].root   // AC follows DC
             if s.sComps[i].hDC == nil {
                 return fmt.Errorf( "Missing Huffman table %d for DC scan (component %d)\n",
@@ -153,7 +159,9 @@ func (jpg *Desc) setScan( s *scan, sComp *[]scanCompRef ) error {
         s.sComps[i].dcId = sc.dcId
 
         if s.endSS > 0 {
-            fmt.Printf( "    Huffman AC Id: %d\n", sc.acId )
+            if jpg.Verbose {
+                fmt.Printf( "    Huffman AC Id: %d\n", sc.acId )
+            }
             s.sComps[i].hAC = jpg.hdefs[2*sc.acId+1].root // (2 tables per dest)
             if s.sComps[i].hAC == nil {
                 return fmt.Errorf( "Missing Huffman table %d for AC scan (component %d)\n",
@@ -175,8 +183,10 @@ func (jpg *Desc) setScan( s *scan, sComp *[]scanCompRef ) error {
                                                         roundingFactor - 1) /
                                                                 roundingFactor)
         }
-        fmt.Printf( "    HSF %d, VSF %d, nUnitsRow %d\n",
-                    s.sComps[i].HSF, s.sComps[i].VSF, s.sComps[i].nUnitsRow )
+        if jpg.Verbose {
+            fmt.Printf( "    HSF %d, VSF %d, nUnitsRow %d\n",
+                        s.sComps[i].HSF, s.sComps[i].VSF, s.sComps[i].nUnitsRow )
+        }
         // All other fields are intialized to 0
     }
     return nil
@@ -378,14 +388,14 @@ func (jpg *Desc) startOfFrame( marker uint, sLen uint ) error {
                            marker & 0x0f, sLen, nComponents )
     }
 
+    nLines := uint16(jpg.data[offset+1]) << 8 + uint16(jpg.data[offset+2])
     jpg.frames = append( jpg.frames,
                          frame {
                            id: uint(len(jpg.frames)),
                            encoding: Encoding(marker & 0x0f),
                            resolution: sampling{
                                 samplePrecision: jpg.data[offset],
-                                nLines:       uint16(jpg.data[offset+1]) << 8 +
-                                              uint16(jpg.data[offset+2]),
+                                nLines: nLines,
                                 nSamplesLine: uint16(jpg.data[offset+3]) << 8 +
                                               uint16(jpg.data[offset+4]) },
                            image: jpg } )
@@ -418,36 +428,42 @@ func (jpg *Desc) startOfFrame( marker uint, sLen uint ) error {
     // nMcuRow = ceiling(nSamplesLine / (mhSF * 8))
     maxSamplesMCU := uint16(maxHSF) * 8
     nMcusRow := (frm.resolution.nSamplesLine + maxSamplesMCU - 1) / maxSamplesMCU
-    fmt.Printf( "  Frame: %d samples per line, max horizontal SF %d, nMCUs/row %d\n",
-                frm.resolution.nSamplesLine, frm.resolution.mhSF, nMcusRow )
-
+    if jpg.Verbose {
+        fmt.Printf( "  Frame: %d samples per line, max horizontal SF %d, nMCUs/row %d\n",
+                    frm.resolution.nSamplesLine, frm.resolution.mhSF, nMcusRow )
+    }
+    // a few badly encoded pictures come with huge and invalid number of lines
+    if nLines > 20000 { // arbitrary large number that should never occur in a picture
+        nLines = 0  // force unknown number of lines in following calculations
+    }
     // In a column the number of data units must be a multiple of the number of
     // MCUs. Each MCU contains mvSF data units of the main component (usually
     // the Y component) and each data unit contains exactly 8 samples. So the
     // actual number of MCUs that must be encoded in a column is given by
     // nMcuCol = ceiling(nLines / (mvSF * 8))
     maxSamplesMCU = uint16(maxVSF * 8) // changed maxSamplesMCU meaning
-    nMcusCol := (frm.resolution.nLines + maxSamplesMCU - 1) / maxSamplesMCU
-    fmt.Printf( "  Frame: %d lines, max vertical SF %d, nMCUs/col %d\n",
-                 frm.resolution.nLines, frm.resolution.mvSF, nMcusCol )
-    fmt.Printf( "  Frame: %d components\n", nComponents );
+    nMcusCol := (nLines + maxSamplesMCU - 1) / maxSamplesMCU
+    if nMcusCol == 0 && jpg.Warn {
+        fmt.Printf("  WARNING: Unknown number of lines\n")
+    }
+    if jpg.Verbose {
+        fmt.Printf( "  Frame: %d lines, max vertical SF %d, nMCUs/col %d\n",
+                     nLines, frm.resolution.mvSF, nMcusCol )
+        fmt.Printf( "  Frame: %d components\n", nComponents );
+    }
     for i := uint(0); i < nComponents; i++ {
         cmp := &frm.components[i]
-        fmt.Printf( "    component %d (%s) id %d:\n", i, componentNames[i], cmp.Id )
         nUnitsRow := uint(nMcusRow) * uint(cmp.HSF)
         cmp.nUnitsRow = nUnitsRow
-        fmt.Printf( "      horizontal sampling factor %d nUnitsRow: %d (%d samples)\n",
-                    cmp.HSF, nUnitsRow, nUnitsRow * 8 )
-
         nUnitsCol := uint(nMcusCol) * uint(cmp.VSF)
-        if nUnitsCol == 0 {
-// FIXME: this is legal => preallocate 0 or some minimum number and allow
-//        dynamic extension during scan - it will just be slower...
-            panic("Unknown number of lines during scan\n")
-        }
-        fmt.Printf( "      vertical sampling factor %d nUnitsCol: %d (%d lines)\n",
-                    cmp.VSF, nUnitsCol, nUnitsCol * 8 )
 
+        if jpg.Verbose {
+            fmt.Printf( "    component %d (%s) id %d:\n", i, componentNames[i], cmp.Id )
+            fmt.Printf( "      horizontal sampling factor %d nUnitsRow: %d (%d samples)\n",
+                        cmp.HSF, nUnitsRow, nUnitsRow * 8 )
+            fmt.Printf( "      vertical sampling factor %d nUnitsCol: %d (%d lines)\n",
+                        cmp.VSF, nUnitsCol, nUnitsCol * 8 )
+        }
         cmp.iDCTdata = make( []iDCTRow, nUnitsCol )
         for j := uint(0); j < nUnitsCol; j++ {
             cmp.iDCTdata[j] = make( []dataUnit, nUnitsRow )
@@ -575,10 +591,6 @@ func (jpg *Desc) processScanHeader( sLen uint, sc *scan ) (err error) {
     sABP := jpg.data[offset+2]
     sc.sABPh = sABP >> 4
     sc.sABPl = sABP & 0x0f
-
-    // FIXME: check if frame nLines is bigger than a threshold (considered as invalid)
-    //        and set it to 0 before calling setScan
-
     err = jpg.setScan( sc, &sCs );
     return
 }
@@ -934,6 +946,10 @@ func (jpg *Desc)defineQuantizationTable( marker, sLen uint ) ( err error ) {
             }
             qts.data[qtn][i+1] = jpg.qdefs[tq].values[i]
         }
+        if jpg.Verbose {
+            fmt.Printf("Quantization table dest %d defined\n", tq )
+        }
+
         qtn++
         if offset >= end {
             break
@@ -1200,8 +1216,9 @@ func (jpg *Desc)defineHuffmanTable( marker, sLen uint ) ( err error ) {
             voffset += li
         }
         jpg.hdefs[td].root = buildTree( jpg.hdefs[td].values )
-        fmt.Printf("Huffman table class %d dest %d defined\n", tc, th )
-
+        if jpg.Verbose {
+            fmt.Printf("Huffman table class %d dest %d defined\n", tc, th )
+        }
         ht++
         offset = voffset;
         if offset >= end {
@@ -1297,12 +1314,15 @@ func (jpg *Desc)defineNumberOfLines( marker, sLen uint ) ( err error ) {
     var toRemove bool
     if ( cf.resolution.nLines != 0 ) {
         if jpg.Warn {
-            fmt.Printf( "Warning: DNL table found with non 0 SOF number " +
+            fmt.Printf( "  Warning: DNL table found with non 0 SOF number" +
                         "of lines (%d)\n", cf.resolution.nLines )
         }
         if jpg.TidyUp {
             toRemove = true
         }
+    }
+    if jpg.Verbose {
+        fmt.Printf("DNL table defined: %d lines\n", nLines )
     }
     nls := new( dnlSeg )
     nls.nLines = nLines
@@ -1311,19 +1331,29 @@ func (jpg *Desc)defineNumberOfLines( marker, sLen uint ) ( err error ) {
     return
 }
 
-func (jpg *Desc)fixLines( ) {
-
+func (jpg *Desc)checkLines( ) error {
+    // lines are updated to dnlLines or scanLines when the frame is serialized
     frm := jpg.getCurrentFrame( )
-    if frm.encoding > HuffmanExtendedSequential {
-        fmt.Printf("Non Sequential Huffman coded frame(s): lines are left untouched\n")
-        return
+    if ! jpg.TidyUp {
+        if frm.resolution.nLines == 0 && frm.resolution.dnlLines == 0 {
+            return fmt.Errorf("No DNL segment and no number of lines in frame header\n")
+        }
+        return nil
+    }
+
+    if frm.encoding > HuffmanProgressive {
+        if jpg.Warn {
+            fmt.Printf("  WARNING: Non Sequential Huffman coded frame(s): lines are left untouched\n")
+        }
+        return nil
     }
     // use actual number of unit rows from Y component
     nLines := len(frm.components[0].iDCTdata)   // nUnits Y Col
     yVSF := int(frm.components[0].VSF)          // nUnits per MCU col
+
     for _, cmp := range frm.components {
-        if (len(frm.components[0].iDCTdata) * yVSF) / int(cmp.VSF) != nLines {
-            panic( "Inconsistent frame component resolution\n" )
+        if (len(cmp.iDCTdata) * yVSF) / int(cmp.VSF) != nLines {
+            return fmt.Errorf("Inconsistent frame component number of lines\n" )
         }
     }
     scanLines := uint16(nLines * 8)             // 8 pixel lines per unit
@@ -1334,4 +1364,5 @@ func (jpg *Desc)fixLines( ) {
                     frm.resolution.nLines, scanLines )
         frm.resolution.scanLines = scanLines
     }
+    return nil
 }
