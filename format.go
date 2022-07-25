@@ -301,7 +301,8 @@ func (j *Desc)formatEntropySegment( w io.Writer, frame uint,
     case ArithmeticCoding:
         return j.formatArithmeticEntropy( w, frame, dest, mode, false )
     default:
-        panic( "formatEntropySegment: illegal entropy type\n" )
+        return 0, fmt.Errorf("formatEntropySegment: illegal entropy type %d\n",
+                             frs.entropyCoding() )
     }
 }
 

@@ -415,7 +415,7 @@ func (jpg *Desc) writeBW( f *os.File, frm *frame, samples [](*[]uint8),
 
 func (jpg *Desc) writeYCbCr( f *os.File, frm *frame, samples [](*[]uint8),
                              o *Orientation ) (nc, nr uint, n int, err error) {
-    if len(samples) != 3 {
+    if len(samples) != 3 {  // contract: writeYCbCr requires 3 components
         panic("writeYCbCr: incorrect number of components\n")
     }
 

@@ -540,9 +540,9 @@ func printDataUnit( dU *dataUnit ) {
 func (jpg *Desc) getBitString( startByte uint, startBit uint8, nBits uint ) string {
 //fmt.Printf("startByte %#x startBit=%d nBits=%d\n", startByte, startBit, nBits)
 
-    if startBit >= 8 {  // logical error => panic to fix it
+    if startBit >= 8 {
         fmt.Printf("getBitString: startBit %d\n", startBit)
-        panic("startBit >= 8")
+        panic("startBit >= 8")      // internal logical error
     }
 
 //offset=0x269 [0xf5       00111---] Huffman: size 7 (0-runlength 0)
@@ -612,7 +612,7 @@ func (jpg *Desc) getBitString( startByte uint, startBit uint8, nBits uint ) stri
 func (jpg *Desc) processSequentialEcs( nMCUs uint, scan *scan ) (uint, error) {
 
     if ( scan.startSS != 0 || scan.sABPh != 0 ) {
-        panic( "processSequentialEcs called for wrong scan" )
+        panic( "processSequentialEcs called for wrong scan" )  // internal error
     }
     if jpg.Verbose {
         fmt.Printf( "Entering processSequentialEcs Approximation bits h=%d l=%d spectral selection start=%d end=%d\n",
@@ -755,7 +755,8 @@ encodedLoop:
                 }
                 break                   // return condition
             } else if padding {
-                panic( "Padding not at the end of entropy coded segment\n" )
+                return nMCUs, fmt.Errorf(
+                     "Padding bits not at the end of entropy coded segment\n" )
             }
         }
         for {                           // curbyte bit loop
@@ -780,14 +781,18 @@ encodedLoop:
                                 }
                                 curByte <<= 1
                                 if (curByte & 0x80) != 0x80 {
-                                    panic("Invalid code/huffman tree (left)\n")
+                                    return nMCUs, fmt.Errorf(
+                                           "Invalid code/huffman tree (left)\n")
                                 }
                             }
                         }
                         huffval <<= 1
                         huffval ++
                     } else {
-                        if curHcnode.right == nil { panic("Invalid code/huffman tree (right)\n") }
+                        if curHcnode.right == nil {
+                            return nMCUs, fmt.Errorf(
+                                          "Invalid code/huffman tree (right)\n")
+                        }
                         curHcnode = curHcnode.right
                         huffval <<= 1
                     }
@@ -985,7 +990,7 @@ encodedLoop:
 func (jpg *Desc) processRefiningDcEcs( nMCUs uint, scan *scan ) (uint, error) {
 
     if scan.startSS != 0 || scan.endSS != 0 || scan.sABPh == 0 {
-        panic( "processRefiningDcEcs called for wrong scan" )
+        panic( "processRefiningDcEcs called for wrong scan" )  // internal error
     }
     if jpg.Verbose {
         fmt.Printf( "Entering processRefiningDcEcs Approximation bits h=%d l=%d"+
@@ -1058,7 +1063,8 @@ encodedLoop:
                 }
                 break                   // return condition
             } else if padding {
-                panic( "Padding not at the end of entropy coded segment\n" )
+                return nMCUs, fmt.Errorf(
+                           "Padding not at the end of entropy coded segment\n" )
             }
         }
         for {                           // curbyte bit loop
@@ -1125,7 +1131,7 @@ encodedLoop:
                     fmt.Printf( "Reached end of pre-allocated data units\n" )
                 }
                 padding = true
-                dUnit = nil     // temporarily: force panic if any data is written afterwards
+                //dUnit = nil
             }
         }   // end curbyte bit loop
     }   // end encodedLoop
@@ -1137,7 +1143,7 @@ encodedLoop:
 func (jpg *Desc) processInitialAcEcs( nMCUs uint, scan *scan ) (uint, error) {
 
     if ( scan.startSS == 0 || scan.sABPh != 0 || len(scan.sComps) > 1 ) {
-        panic( "processInitialAcEcs called for wrong scan" )
+        panic( "processInitialAcEcs called for wrong scan" )   // internal error
     }
     if jpg.Verbose {
         fmt.Printf( "Entering processInitialAcEcs Approximation bits h=%d l=%d"+
@@ -1198,7 +1204,8 @@ encodedLoop:
                 }
                 break                   // return condition
             } else if padding {
-                panic( "Padding not at the end of entropy coded segment\n" )
+                return nMCUs, fmt.Errorf(
+                           "Padding not at the end of entropy coded segment\n" )
             }
         }
         for {                           // curbyte bit loop
@@ -1225,7 +1232,8 @@ encodedLoop:
                                 }
                                 curByte <<= 1
                                 if (curByte & 0x80) != 0x80 {
-                                    panic("Invalid code/huffman tree (left)\n")
+                                    return nMCUs, fmt.Errorf(
+                                           "Invalid code/huffman tree (left)\n")
                                 }
                             }
                         }
@@ -1233,7 +1241,10 @@ encodedLoop:
                         huffval ++
                     } else {
                         curHcnode = curHcnode.right
-                        if curHcnode == nil { panic("Invalid code/huffman tree (right)\n") }
+                        if curHcnode == nil {
+                            return nMCUs, fmt.Errorf(
+                                          "Invalid code/huffman tree (right)\n")
+                            }
                         huffval <<= 1
                     }
                     curByte <<= 1
@@ -1380,7 +1391,7 @@ encodedLoop:
 func (jpg *Desc) processRefiningAcEcs( nMCUs uint, scan *scan ) (uint, error) {
 
     if scan.startSS == 0 || scan.sABPh == 0 || len(scan.sComps) > 1 {
-        panic( "processRefiningAcEcs called for wrong scan" )
+        panic( "processRefiningAcEcs called for wrong scan" )  // internal error
     }
     if jpg.Verbose {
         fmt.Printf( "Entering processRefiningAcEcs Approximation bits h=%d l=%d"+
@@ -1450,7 +1461,8 @@ encodedLoop:
                 }
                 break                   // return condition
             } else if padding {
-                panic( "processRefiningAcEcs: Padding not at the end of entropy coded segment\n" )
+                return nMCUs, fmt.Errorf(
+                  "processRefiningAcEcs: Padding not at the end of entropy coded segment\n")
             }
         }
         for {                           // curbyte bit loop
@@ -1474,7 +1486,8 @@ encodedLoop:
                                 }
                                 curByte <<= 1
                                 if (curByte & 0x80) != 0x80 {
-                                    panic("processRefiningAcEcs: Invalid code/huffman tree (left)\n")
+                                    return nMCUs, fmt.Errorf(
+                                        "processRefiningAcEcs: Invalid code/huffman tree (left)\n")
                                 }
                             }
                         }
@@ -1482,7 +1495,10 @@ encodedLoop:
                         huffval ++
                     } else {
                         curHcnode = curHcnode.right
-                        if curHcnode == nil { panic("processRefiningAcEcs: Invalid code/huffman tree (right)\n") }
+                        if curHcnode == nil {
+                            return nMCUs, fmt.Errorf(
+                                "processRefiningAcEcs: Invalid code/huffman tree (right)\n")
+                        }
                         huffval <<= 1
                     }
                     curByte <<= 1

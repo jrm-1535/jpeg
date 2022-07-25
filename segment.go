@@ -107,7 +107,9 @@ var componentNames = [...]string{ "Y", "Cb", "Cr" }
 func (jpg *Desc) setScan( s *scan, sComp *[]scanCompRef ) error {
 
     frm := jpg.getCurrentFrame()
-    if frm == nil { panic( "No frame for scan\v" ) }
+    if frm == nil {
+        return fmt.Errorf( "No frame for scan\n" )
+    }
 
     nComp := len( *sComp )
     if jpg.Verbose {
@@ -260,7 +262,9 @@ func makeCompString( comp string, h, v uint8 ) string {
 func mcuFormat( sc *scan ) string {
 
     nCmp := len( sc.sComps )
-    if nCmp != 3 && nCmp != 1 { panic("Unsupported MCU format\n") }
+    if nCmp != 3 && nCmp != 1 {
+        return ""   // Unsupported MCU format
+    }
 
     luma := makeCompString( "Y", sc.sComps[0].HSF, sc.sComps[0].VSF )
     var mcuf string
@@ -610,7 +614,8 @@ func (jpg *Desc)getEcsFct( frm *frame,
     case ExtendedProgressive:
         if s.startSS == 0 {     // include DC coefficient
             if s.endSS != 0 {
-                panic( "Progressive frame mixing DC and AC coefficient in same scan" )
+                err = fmt.Errorf("Progressive frame mixing DC and AC coefficient in same scan")
+                break
             }
             if s.sABPh == 0 {   // treat initial DC scan as sequential
                 f = jpg.processSequentialEcs
@@ -620,7 +625,8 @@ func (jpg *Desc)getEcsFct( frm *frame,
             }
         } else {                // only AC coefficients
             if len( s.sComps ) != 1 {
-                panic( "Progressive frame AC only scan with multiple components" )
+                err = fmt.Errorf("Progressive frame AC only scan with multiple components")
+                break;
             }
             if s.sABPh == 0 {   // initial AC scan
                 f = jpg.processInitialAcEcs
@@ -644,7 +650,7 @@ func (jpg *Desc) processScan( marker, sLen uint ) error {
 
     frm := jpg.getCurrentFrame( )
     if frm == nil {
-        panic( "Scan without frame" )
+        return fmt.Errorf("Scan without frame")
     }
 
     frm.scans = append( frm.scans, scan{ } )    // add new unknown scan
@@ -993,7 +999,7 @@ func printTree( cw *cumulativeWriter, root *hcnode, indent string ) {
     printNodes( root )
 }
 
-func buildTree( values [16][]uint8 ) (root *hcnode) {
+func buildTree( values [16][]uint8 ) (root *hcnode, err error) {
 
     root = new( hcnode )
     var last *hcnode = root
@@ -1019,20 +1025,22 @@ func buildTree( values [16][]uint8 ) (root *hcnode) {
                 } else {
 //                    fmt.Printf( "level %d Last node %p .left & right are not nil, back up\n", level, last  )
                     if level == 0 {
-                        panic( fmt.Sprintf( "backing up above root: code length %d, level %d last %p, root %p\n",
-                                            cl, level, last, root ) )
+                        err = fmt.Errorf( "Huffman tree building: backing up"+
+                                          " above root: code length %d, level"+
+                                          " %d last %p, root %p\n",
+                                          cl, level, last, root )
+                        return
                     }
                     last = last.parent
                     level--
                 }
             }
 
-//            fmt.Printf( "level %d, last node %p\n", level, last )
-            // last is a new leaf
             if last.left != nil || last.right != nil {
-                panic( fmt.Sprintf( "level %d Last node %p is not a leaf node", level, last ) )
+                err = fmt.Errorf( "Huffman tree building: level %d Last node %p"+
+                                  " is not a leaf node", level, last )
+                return
             }
-//            fmt.Printf( "Make node for symbols 0x%02x\n", symbol )
             last.symbol = symbol
             last = last.parent
             level--
@@ -1058,11 +1066,8 @@ func (hs *htSeg)serialize( w io.Writer ) (int, error) {
         for j := 0; j < 16; j++ {
             sz += len(hs.htcds[i].data[j])
         }
-//        fmt.Printf( "nb values for table %d class %d dest %d is %d\n",
-//                    i, hs.htcds[i].hc, hs.htcds[i].hd, sz )
         lh += uint16(sz)
     }
-//    fmt.Printf( "Total huffman segment length = %d\n", lh )
 
     seg := make( []byte, lh + 2 )
     binary.BigEndian.PutUint16( seg[0:], _DHT )
@@ -1071,9 +1076,7 @@ func (hs *htSeg)serialize( w io.Writer ) (int, error) {
     for i := 0; i < len(hs.htcds); i++ {
         seg[j] = (hs.htcds[i].hc << 4) | hs.htcds[i].hd
         j++
-//        sz := 0
         for k := 0; k < 16; k++ {
-//            sz += len(hs.htcds[i].data[k])
             seg[j] = byte( len(hs.htcds[i].data[k]) )
             j++
         }
@@ -1147,8 +1150,10 @@ func formatHuffmanDest( cw *cumulativeWriter, ht *htcd, mode FormatMode ) {
         cw.format( "    Total number of symbols: %d\n", nSymbols )
     }
     if mode == Extra || mode == Both {
-        root := buildTree( ht.data )
-        printTree( cw, root, "    " )
+        root, err := buildTree( ht.data )
+        if err == nil {
+            printTree( cw, root, "    " )
+        }
     }
     return
 }
@@ -1215,7 +1220,10 @@ func (jpg *Desc)defineHuffmanTable( marker, sLen uint ) ( err error ) {
             copy( hts.htcds[ht].data[hcli], jpg.hdefs[td].values[hcli] )
             voffset += li
         }
-        jpg.hdefs[td].root = buildTree( jpg.hdefs[td].values )
+        jpg.hdefs[td].root, err = buildTree( jpg.hdefs[td].values )
+        if err != nil {
+            return
+        }
         if jpg.Verbose {
             fmt.Printf("Huffman table class %d dest %d defined\n", tc, th )
         }
@@ -1234,7 +1242,7 @@ func (jpg *Desc)defineHuffmanTable( marker, sLen uint ) ( err error ) {
     } else if jpg.Warn {
         fmt.Printf("defineHuffmanTable: Warning: empty segment (ignoring)\n")
     }
-    return nil
+    return
 }
 
 // -------------- comment segment
@@ -1303,7 +1311,9 @@ func (jpg *Desc)defineNumberOfLines( marker, sLen uint ) ( err error ) {
         return fmt.Errorf( "defineNumberOfLines: Wrong DNL header (len %d)\n", sLen )
     }
     cf := jpg.getCurrentFrame()
-    if cf == nil { panic("defineNumberOfLines: no current frame\n") }
+    if cf == nil {
+        return fmt.Errorf("defineNumberOfLines: no current frame\n")
+    }
     if cf.resolution.dnlLines != 0 {
         return fmt.Errorf( "defineNumberOfLines: Multiple DNL tables\n" )
     }

@@ -142,7 +142,7 @@ func (a0 *app0)commonFormat( w io.Writer ) (int, error) {
         cw.format( "  density %d,%d %s\n", a0.hDensity, a0.vDensity, symb )
         cw.format( "  thumbnail %d,%d pixels\n", a0.htNail, a0.vtNail )
     default:
-        panic("format app0: not a valid app\n")
+        cw.setError( fmt.Errorf("format app0: not a valid JFIF or JFIF Extension format\n") )
     }
     return cw.result()
 }
